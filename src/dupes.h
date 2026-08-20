@@ -33,12 +33,16 @@ struct Member {
     bool selected = true;  // ticked for removal; the keeper is never selected
 };
 
-// Two or more files with identical contents.
+// Files with identical contents. Two or more of them, unless `unique` is set, in
+// which case it is the one file that matched nothing.
 struct DupGroup {
     uint64_t size = 0;            // every member has this size
-    std::vector<Member> members;  // never fewer than two
+    std::vector<Member> members;
     int keeper = 0;               // index within members
     bool userPinned = false;      // keeper chosen by hand, priority no longer moves it
+    // Reported by a uniques scan: this file has no copy anywhere in the inputs,
+    // so there is no keeper to protect and nothing here is safe to delete.
+    bool unique = false;
 };
 
 // How a keeper is chosen between members whose input directories rank equally,

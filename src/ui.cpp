@@ -77,13 +77,23 @@ void drawTopBar(AppState& s) {
         }
     } else if (s.haveResults) {
         const Totals& t = s.totals;
-        ImGui::TextColored(kDim,
-                           "%s files scanned   %s groups   %s extras   %s reclaimable   "
-                           "read %s in %s",
-                           formatCount(s.stats.walk.filesSeen).c_str(),
-                           formatCount(t.groups).c_str(), formatCount(t.extras).c_str(),
-                           formatSize(t.reclaimable).c_str(), formatSize(s.stats.bytesRead).c_str(),
-                           formatDuration(s.stats.seconds).c_str());
+        if (t.uniques > 0) {
+            ImGui::TextColored(kDim,
+                               "%s files scanned   %s with no copy anywhere   read %s in %s",
+                               formatCount(s.stats.walk.filesSeen).c_str(),
+                               formatCount(t.uniques).c_str(),
+                               formatSize(s.stats.bytesRead).c_str(),
+                               formatDuration(s.stats.seconds).c_str());
+        } else {
+            ImGui::TextColored(kDim,
+                               "%s files scanned   %s groups   %s extras   %s reclaimable   "
+                               "read %s in %s",
+                               formatCount(s.stats.walk.filesSeen).c_str(),
+                               formatCount(t.groups).c_str(), formatCount(t.extras).c_str(),
+                               formatSize(t.reclaimable).c_str(),
+                               formatSize(s.stats.bytesRead).c_str(),
+                               formatDuration(s.stats.seconds).c_str());
+        }
     } else {
         ImGui::TextColored(kDim, "no scan yet");
     }
@@ -105,7 +115,9 @@ void collectBackgroundWork(AppState& s) {
         if (s.stats.cancelled) {
             s.notice = "scan cancelled, no results";
         } else if (s.groups.empty()) {
-            s.notice = "no duplicates found";
+            s.notice = s.pipeline.report == ReportMode::Uniques
+                           ? "every file has a copy somewhere in the inputs"
+                           : "no duplicates found";
         }
     }
 
@@ -141,6 +153,13 @@ void drawApplyConfirm(AppState& s) {
     if (!ImGui::BeginPopupModal("Confirm", nullptr, ImGuiWindowFlags_AlwaysAutoResize)) return;
 
     const Totals& t = s.totals;
+    if (t.uniques > 0) {
+        ImGui::TextColored(kBad, "These %s file(s) have no other copy anywhere in the inputs.",
+                           formatCount(t.selected).c_str());
+        ImGui::TextColored(kDim, "Moving them removes them from where they are. The run is");
+        ImGui::TextColored(kDim, "recorded, so it can be put back.");
+        ImGui::Spacing();
+    }
     if (s.action == ActionKind::Delete) {
         ImGui::TextColored(kBad, "Permanently delete %s file(s), freeing %s.",
                            formatCount(t.selected).c_str(), formatSize(t.selectedBytes).c_str());
@@ -232,19 +251,22 @@ void startScan(AppState& s) {
 std::vector<ActionItem> collectSelected(const AppState& s) {
     std::vector<ActionItem> out;
     for (const auto& g : s.groups) {
+        if (g.members.empty()) continue;
         const FileEntry& keeper = s.files[g.members[g.keeper].fileIndex];
         for (size_t i = 0; i < g.members.size(); ++i) {
             if (!g.members[i].selected) continue;
-            if (static_cast<int>(i) == g.keeper) continue;  // belt and braces
+            // Belt and braces on a duplicate group; a unique row has no keeper
+            // to skip, and its one file is the thing being acted on.
+            if (!g.unique && static_cast<int>(i) == g.keeper) continue;
 
             const FileEntry& f = s.files[g.members[i].fileIndex];
             ActionItem item;
             item.path = f.path;
-            item.keeper = keeper.path;
+            item.keeper = g.unique ? std::string() : keeper.path;
             item.size = f.size;
             item.mtime = f.mtime;
-            item.keeperSize = keeper.size;
-            item.keeperMtime = keeper.mtime;
+            item.keeperSize = g.unique ? 0 : keeper.size;
+            item.keeperMtime = g.unique ? 0 : keeper.mtime;
             item.hash = f.fullHash;
             out.push_back(std::move(item));
         }
@@ -309,12 +331,12 @@ void drawUi(AppState& s) {
 
     // Inputs on the left, everything that shapes the scan on the right.
     const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-    ImGui::BeginChild("inputs", ImVec2(half, 300));
+    ImGui::BeginChild("inputs", ImVec2(half, 320));
     drawInputs(s);
     ImGui::EndChild();
 
     ImGui::SameLine();
-    ImGui::BeginChild("pipeline", ImVec2(half, 300));
+    ImGui::BeginChild("pipeline", ImVec2(half, 320));
     drawPipeline(s);
     ImGui::EndChild();
 

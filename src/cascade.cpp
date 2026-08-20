@@ -172,7 +172,8 @@ struct Reporter {
 // as a split rather than as a wrong group.
 std::vector<Bucket> exactSplit(const Bucket& bucket, const std::vector<FileEntry>& files,
                                const CascadeHooks& hooks, Reporter& rep,
-                               std::atomic<uint64_t>& errors, const ChunkFn& onChunk) {
+                               std::atomic<uint64_t>& errors, const ChunkFn& onChunk,
+                               std::vector<char>& unreadable) {
     std::vector<Bucket> out;
     Bucket remaining = bucket;
 
@@ -193,6 +194,10 @@ std::vector<Bucket> exactSplit(const Bucket& bucket, const std::vector<FileEntry
                 // Unreadable now means it cannot be compared, so it leaves the
                 // running entirely rather than being assumed identical.
                 errors.fetch_add(1);
+                // Distinct indices from distinct threads, so no lock is needed;
+                // without this the file would later be reported as having no
+                // copy, when the truth is that it could not be read.
+                unreadable[remaining[i]] = 1;
                 rep.error(files[remaining[i]].path + ": unreadable during byte comparison");
             } else {
                 rest.push_back(remaining[i]);
@@ -208,6 +213,7 @@ std::vector<Bucket> exactSplit(const Bucket& bucket, const std::vector<FileEntry
 // "first 65536 bytes" reads better in the log than the bare rule name.
 std::string ruleLabel(const Rule& r) {
     if (r.kind == RuleKind::HeadBytes) return "first " + formatSize(r.number);
+    if (r.kind == RuleKind::SampledHash) return formatSize(r.number) + " sampled";
     return ruleKindName(r.kind);
 }
 
@@ -221,6 +227,7 @@ const char* stageName(Stage s) {
         case Stage::SameName: return "matching filenames";
         case Stage::SameMtime: return "matching mtimes";
         case Stage::HeadBytes: return "hashing first bytes";
+        case Stage::SampledHash: return "sampling contents";
         case Stage::FullHash: return "hashing contents";
         case Stage::ExactCompare: return "comparing bytes";
         case Stage::Grouping: return "building groups";
@@ -235,6 +242,7 @@ Stage stageForRule(RuleKind kind) {
         case RuleKind::SameName: return Stage::SameName;
         case RuleKind::SameMtime: return Stage::SameMtime;
         case RuleKind::HeadBytes: return Stage::HeadBytes;
+        case RuleKind::SampledHash: return Stage::SampledHash;
         case RuleKind::FullHash: return Stage::FullHash;
         case RuleKind::ExactBytes: return Stage::ExactCompare;
         default: return Stage::Sizing;
@@ -248,6 +256,11 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
     // One callback shared by every reader, so progress moves inside a single
     // multi-gigabyte file rather than only when it finishes.
     const ChunkFn onChunk = [&](uint64_t n) { rep.pulse(n); };
+
+    // Files a row could not read. They are neither duplicates nor uniques: what
+    // is true of them is unknown, so they are left out of both answers rather
+    // than being reported as having no copy.
+    std::vector<char> unreadable(files.size(), 0);
 
     // Size, always first and never a row. Free, because the walk already called
     // lstat, and it is what makes every later row affordable.
@@ -287,7 +300,7 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
             // what makes a repeat scan cheap: most files on a real tree are
             // small ones that never reach it.
             if (f.headIsFull && hooks.cache &&
-                hooks.cache->lookup(f.dev, f.ino, f.size, f.mtime, h)) {
+                hooks.cache->lookup(f.path, 0, f.size, f.mtime, h)) {
                 f.headHash = h;
                 f.fullHash = h;
                 f.hashed = true;
@@ -297,7 +310,7 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
                 if (f.headIsFull) {
                     f.fullHash = h;
                     f.hashed = true;
-                    if (hooks.cache) hooks.cache->insert(f.dev, f.ino, f.size, f.mtime, h);
+                    if (hooks.cache) hooks.cache->insert(f.path, 0, f.size, f.mtime, h);
                 }
                 rep.bytes.fetch_add(std::min<uint64_t>(f.size, headSize));
             } else {
@@ -310,10 +323,79 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
         rep.flush();
         if (cancelled()) return;
 
+        for (size_t i = 0; i < bad.size(); ++i) {
+            if (bad[i]) unreadable[i] = 1;
+        }
         for (auto& b : buckets) {
             b.erase(std::remove_if(b.begin(), b.end(), [&](int i) { return bad[i] != 0; }), b.end());
         }
         buckets = repartition<uint64_t>(buckets, [&](int i) { return files[i].headHash; });
+        errors = failed.load();
+        cacheHits = hits.load();
+    };
+
+    // A megabyte of reading in place of a whole file. Every member of a bucket
+    // shares its size, because the size row runs first and nothing after it ever
+    // merges buckets, so a bucket is never a mix of sampled and full hashes.
+    const auto runSampledHash = [&](uint64_t sampleBytes, uint64_t& errors, uint64_t& cacheHits) {
+        std::vector<int> candidates = flatten(buckets);
+        uint64_t expected = 0;
+        for (int i : candidates) expected += std::min<uint64_t>(files[i].size, sampleBytes);
+        rep.stage(Stage::SampledHash, candidates.size(), candidates.size(), expected);
+        std::vector<char> bad(files.size(), 0);
+        std::vector<uint64_t> key(files.size(), 0);
+        std::atomic<uint64_t> failed {0}, hits {0};
+
+        parallelFor(candidates.size(), pipe.threads, hooks.cancel, [&](size_t k) {
+            const int i = candidates[k];
+            FileEntry& f = files[i];
+            uint64_t h = 0;
+
+            // A file small enough to have been read end to end was cached as a
+            // full hash, so that is the entry to ask for.
+            const uint64_t variant = f.size <= sampleBytes ? 0 : sampleBytes;
+            if (hooks.cache && hooks.cache->lookup(f.path, variant, f.size, f.mtime, h)) {
+                key[i] = h;
+                if (variant == 0) {
+                    f.fullHash = h;
+                    f.hashed = true;
+                }
+                hits.fetch_add(1);
+                rep.tick();
+                return;
+            }
+
+            rep.setCurrent(f.path);
+            bool wholeFile = false;
+            if (hashSampled(f.path, f.size, sampleBytes, hooks.cancel, h, wholeFile, &rep.bytes,
+                            &onChunk)) {
+                key[i] = h;
+                // Small enough to have been read in full, so this is the real
+                // content hash: record it as one and let a later full hash row
+                // skip the file entirely.
+                if (wholeFile) {
+                    f.fullHash = h;
+                    f.hashed = true;
+                }
+                if (hooks.cache) hooks.cache->insert(f.path, wholeFile ? 0 : sampleBytes, f.size,
+                                                     f.mtime, h);
+            } else if (!cancelled()) {
+                bad[i] = 1;
+                failed.fetch_add(1);
+                rep.error(f.path + ": unreadable, excluded from the scan");
+            }
+            rep.tick();
+        });
+        rep.flush();
+        if (cancelled()) return;
+
+        for (size_t i = 0; i < bad.size(); ++i) {
+            if (bad[i]) unreadable[i] = 1;
+        }
+        for (auto& b : buckets) {
+            b.erase(std::remove_if(b.begin(), b.end(), [&](int i) { return bad[i] != 0; }), b.end());
+        }
+        buckets = repartition<uint64_t>(buckets, [&](int i) { return key[i]; });
         errors = failed.load();
         cacheHits = hits.load();
     };
@@ -335,7 +417,7 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
             const FileEntry& f = files[i];
             uint64_t h = 0;
 
-            if (hooks.cache && hooks.cache->lookup(f.dev, f.ino, f.size, f.mtime, h)) {
+            if (hooks.cache && hooks.cache->lookup(f.path, 0, f.size, f.mtime, h)) {
                 files[i].fullHash = h;
                 files[i].hashed = true;
                 hits.fetch_add(1);
@@ -349,7 +431,7 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
             if (hashFull(f.path, hooks.cancel, h, &rep.bytes, &onChunk)) {
                 files[i].fullHash = h;
                 files[i].hashed = true;
-                if (hooks.cache) hooks.cache->insert(f.dev, f.ino, f.size, f.mtime, h);
+                if (hooks.cache) hooks.cache->insert(f.path, 0, f.size, f.mtime, h);
             } else if (!cancelled()) {
                 bad[i] = 1;
                 failed.fetch_add(1);
@@ -360,6 +442,9 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
         rep.flush();
         if (cancelled()) return;
 
+        for (size_t i = 0; i < bad.size(); ++i) {
+            if (bad[i]) unreadable[i] = 1;
+        }
         for (auto& b : buckets) {
             b.erase(std::remove_if(b.begin(), b.end(),
                                    [&](int i) { return bad[i] != 0 || !files[i].hashed; }),
@@ -384,7 +469,7 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
         std::atomic<uint64_t> failed {0};
 
         parallelFor(buckets.size(), pipe.threads, hooks.cancel, [&](size_t k) {
-            perBucket[k] = exactSplit(buckets[k], files, hooks, rep, failed, onChunk);
+            perBucket[k] = exactSplit(buckets[k], files, hooks, rep, failed, onChunk, unreadable);
             rep.tick();
         });
         rep.flush();
@@ -415,6 +500,7 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
                 buckets = repartition<int64_t>(buckets, [&](int i) { return files[i].mtime; });
                 break;
             case RuleKind::HeadBytes: runHeadBytes(rule.number, errors, cacheHits); break;
+            case RuleKind::SampledHash: runSampledHash(rule.number, errors, cacheHits); break;
             case RuleKind::FullHash: runFullHash(errors, cacheHits); break;
             case RuleKind::ExactBytes: runExactCompare(errors); break;
             default: continue;  // drop rows were applied during the walk
@@ -432,6 +518,44 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
     }
 
     rep.stage(Stage::Grouping, buckets.size(), countIn(buckets));
+
+    if (pipe.report == ReportMode::Uniques) {
+        // Every file that entered either survived into a bucket of two or more,
+        // or was dropped alone by some row. The second set is the answer, and it
+        // is easier to take by subtraction than by instrumenting every drop.
+        std::vector<char> paired(files.size(), 0);
+        for (const auto& b : buckets) {
+            if (b.size() < 2) continue;
+            for (int i : b) paired[i] = 1;
+        }
+
+        std::vector<int> alone;
+        for (size_t i = 0; i < files.size(); ++i) {
+            if (!paired[i] && !unreadable[i]) alone.push_back(static_cast<int>(i));
+        }
+        std::sort(alone.begin(), alone.end(), [&](int x, int y) {
+            if (files[x].rootIndex != files[y].rootIndex) {
+                return files[x].rootIndex < files[y].rootIndex;
+            }
+            return files[x].path < files[y].path;
+        });
+
+        std::vector<DupGroup> lonely;
+        lonely.reserve(alone.size());
+        for (int i : alone) {
+            DupGroup g;
+            g.size = files[i].size;
+            g.unique = true;
+            // Selected by default like any other row, but there is no keeper
+            // behind it: the interface refuses to delete these, and only offers
+            // the reversible move.
+            g.members.push_back(Member {i, true});
+            lonely.push_back(std::move(g));
+        }
+        rep.note("uniques: " + formatCount(lonely.size()) + " file(s) with no copy in the inputs");
+        return lonely;
+    }
+
     std::vector<DupGroup> groups;
     groups.reserve(buckets.size());
     for (auto& b : buckets) {

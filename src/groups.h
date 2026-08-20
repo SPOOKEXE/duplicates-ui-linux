@@ -28,6 +28,7 @@ struct Totals {
     uint64_t groups = 0;
     uint64_t extras = 0;       // members that are not keepers
     uint64_t reclaimable = 0;  // bytes freed if every extra went
+    uint64_t uniques = 0;      // rows holding a file with no copy anywhere
     uint64_t selected = 0;
     uint64_t selectedBytes = 0;
 };

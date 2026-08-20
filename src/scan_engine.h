@@ -24,6 +24,7 @@ struct ScanStats {
     uint64_t bytesRead = 0;
     double seconds = 0.0;
     uint64_t cacheHits = 0;
+    uint64_t cacheStale = 0;  // entries thrown out because the file had changed
     uint64_t errors = 0;
     bool cancelled = false;
 };

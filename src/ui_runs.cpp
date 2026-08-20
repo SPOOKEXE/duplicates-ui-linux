@@ -62,10 +62,19 @@ void drawActionBar(AppState& s) {
         s.browser.open("Choose a quarantine folder", s.quarantineRoot);
     }
 
+    // Deleting a file that has no other copy is the one thing this tool exists
+    // to prevent, so a uniques run cannot reach the delete at all.
+    const bool onlyCopies = s.totals.uniques > 0;
     ImGui::SameLine(0, 24);
+    ImGui::BeginDisabled(onlyCopies);
     if (ImGui::Checkbox("delete permanently", &deleting)) {
         s.action = deleting ? ActionKind::Delete : ActionKind::Quarantine;
     }
+    ImGui::EndDisabled();
+    if (onlyCopies && ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("these files have no other copy, so only the reversible move is offered");
+    }
+    if (onlyCopies && s.action == ActionKind::Delete) s.action = ActionKind::Quarantine;
 
     const bool needsRoot = (s.action == ActionKind::Quarantine);
     const bool badRoot = needsRoot && (s.quarantineRoot.empty() || quarantineInsideAnInput(s));

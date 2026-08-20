@@ -98,7 +98,8 @@ std::string serializeSession(const SessionData& d) {
     os << "scope\t" << b(d.scope.includeHidden) << '\t' << b(d.scope.collapseHardlinks) << '\n';
 
     os << "pipe\t" << static_cast<int>(d.pipeline.combine) << '\t'
-       << static_cast<int>(d.pipeline.select) << '\t' << d.pipeline.threads << '\n';
+       << static_cast<int>(d.pipeline.select) << '\t' << d.pipeline.threads << '\t'
+       << static_cast<int>(d.pipeline.report) << '\n';
     // The count is written even when it is zero, because an empty rule list is a
     // real choice and no rule lines at all would be indistinguishable from a
     // file that predates them.
@@ -160,6 +161,11 @@ SessionData parseSession(const std::string& text) {
             d.pipeline.combine = static_cast<PatternCombine>(clampInt(f[1], 0, 1, 0));
             d.pipeline.select = static_cast<PatternSelect>(clampInt(f[2], 0, 1, 0));
             d.pipeline.threads = clampInt(f[3], 1, 16, 4);
+            // Appended after the first v2 files were written, so its absence
+            // means the default rather than a broken record.
+            if (f.size() >= 5) {
+                d.pipeline.report = static_cast<ReportMode>(clampInt(f[4], 0, 1, 0));
+            }
         } else if (kind == "rules") {
             // The list that follows replaces the default one rather than adding
             // to it, so a saved pipeline is what comes back, not a merge.

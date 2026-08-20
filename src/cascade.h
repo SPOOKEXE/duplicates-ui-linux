@@ -20,6 +20,7 @@ enum class Stage {
     SameName,
     SameMtime,
     HeadBytes,
+    SampledHash,
     FullHash,
     ExactCompare,
     Grouping,

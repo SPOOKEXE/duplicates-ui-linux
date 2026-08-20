@@ -22,12 +22,15 @@ enum class RuleKind {
     MaxSize,     // drop
     SameName,    // split
     SameMtime,   // split
-    HeadBytes,   // split
-    FullHash,    // split
-    ExactBytes,  // split
+    HeadBytes,    // split
+    FullHash,     // split
+    ExactBytes,   // split
+    SampledHash,  // split
 };
 
-constexpr int kRuleKindCount = 9;
+// Appended, never inserted: a session file stores a rule's kind as this number,
+// so reordering the enum would silently turn saved rules into other rules.
+constexpr int kRuleKindCount = 10;
 extern const char* const kRuleKindNames[kRuleKindCount];
 
 const char* ruleKindName(RuleKind kind);
@@ -44,6 +47,16 @@ enum class PatternSelect { Exclude, Include };
 extern const char* const kPatternCombineNames[2];
 extern const char* const kPatternSelectNames[2];
 
+// What the scan is being asked for. Every file that enters the cascade either
+// ends up in a group of two or more, or is dropped alone by some row; those two
+// sets are exactly the duplicates and the uniques.
+//
+// This is a property of the whole pipeline rather than of one row. A row that
+// kept its unmatched files would hand the next row nothing but singletons, and
+// no row can split a singleton, so per-row it could only ever mean "stop here".
+enum class ReportMode { Duplicates, Uniques };
+extern const char* const kReportModeNames[2];
+
 struct Rule {
     bool enabled = true;
     RuleKind kind = RuleKind::Glob;
@@ -55,6 +68,7 @@ struct Pipeline {
     std::vector<Rule> rules;
     PatternCombine combine = PatternCombine::Any;
     PatternSelect select = PatternSelect::Exclude;
+    ReportMode report = ReportMode::Duplicates;
     int threads = 4;
 };
 
@@ -79,6 +93,7 @@ struct CompiledPipeline {
     uint64_t minSize = 0;
     uint64_t maxSize = 0;  // 0 means no ceiling
     std::vector<Rule> splits;  // ordered, deduplicated, enabled only
+    ReportMode report = ReportMode::Duplicates;
     int threads = 4;
 
     // Rows that were dropped or could not be built, so the log can say why

@@ -141,6 +141,7 @@ Rule freshRule(RuleKind kind) {
         case RuleKind::MinSize: return Rule {true, kind, {}, 1};
         case RuleKind::MaxSize: return Rule {true, kind, {}, 0};
         case RuleKind::HeadBytes: return Rule {true, kind, {}, 65536};
+        case RuleKind::SampledHash: return Rule {true, kind, {}, 1u << 20};
         default: return Rule {true, kind, {}, 0};
     }
 }
@@ -158,11 +159,12 @@ void drawRuleParam(Rule& r) {
         }
         case RuleKind::MinSize:
         case RuleKind::MaxSize:
-        case RuleKind::HeadBytes: {
+        case RuleKind::HeadBytes:
+        case RuleKind::SampledHash: {
             ImGui::SetNextItemWidth(120);
             ImGui::InputScalar("##num", ImGuiDataType_U64, &r.number);
             ImGui::SameLine();
-            ImGui::TextColored(kDim, "bytes");
+            ImGui::TextColored(kDim, r.kind == RuleKind::SampledHash ? "bytes sampled" : "bytes");
             break;
         }
         default: break;
@@ -284,9 +286,9 @@ void drawPipeline(AppState& s) {
     if (ImGui::Button("Reset", ImVec2(70, 0))) s.pipeline = defaultPipeline();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("back to the default pipeline");
 
-    // These two describe the glob and regex rows as a set, which is not a
-    // per-row question, so they sit under the list rather than in it.
-    ImGui::SameLine(0, 20);
+    // Its own line: the three selectors and the two buttons do not fit on one at
+    // half the window's width, and crowding them pushed the include/exclude box
+    // off the edge entirely.
     ImGui::TextColored(kDim, "patterns");
     ImGui::SameLine();
     ImGui::SetNextItemWidth(70);
@@ -310,6 +312,21 @@ void drawPipeline(AppState& s) {
             "with no patterns at all, both keep everything");
     }
 
+    ImGui::SameLine(0, 20);
+    ImGui::TextColored(kDim, "report");
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(150);
+    int report = static_cast<int>(s.pipeline.report);
+    if (ImGui::Combo("##report", &report, kReportModeNames, 2)) {
+        s.pipeline.report = static_cast<ReportMode>(report);
+    }
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip(
+            "DUPLICATES: files with at least one other copy in the inputs\n"
+            "UNIQUES: the files left over, which have no copy anywhere\n"
+            "a uniques run offers the reversible move only, never the delete");
+    }
+
     const CompiledPipeline compiled = compilePipeline(s.pipeline);
     bool proves = false, hashes = false;
     for (const auto& r : compiled.splits) {
@@ -322,9 +339,14 @@ void drawPipeline(AppState& s) {
     } else if (!compiled.problems.empty()) {
         wrappedColored(kWarn, compiled.problems.front().c_str());
     } else if (!proves) {
-        wrappedColored(kWarn,
-                       "without an exact byte compare, an irreversible delete rests on a 64-bit "
-                       "hash");
+        bool sampled = false;
+        for (const auto& r : compiled.splits) {
+            if (r.kind == RuleKind::SampledHash) sampled = true;
+        }
+        wrappedColored(kBad, sampled ? "without an exact byte compare, a sampled hash is deciding "
+                                       "this: it never looked at most of each file"
+                                     : "without an exact byte compare, an irreversible delete "
+                                       "rests on a 64-bit hash");
     } else {
         wrappedColored(kDim, describePipeline(compiled).c_str());
     }
@@ -332,6 +354,12 @@ void drawPipeline(AppState& s) {
     // Both rows read every surviving candidate in full, so together they read it
     // twice. On a tree of large files that is the difference between an hour and
     // two, and the hash only earns its place when a bucket holds more than a pair.
+    if (s.pipeline.report == ReportMode::Uniques) {
+        wrappedColored(kWarn,
+                       "uniques: every file listed is the only copy of itself, so quarantine is "
+                       "offered and delete is not");
+    }
+
     if (proves && hashes) {
         wrappedColored(kWarn,
                        "hash and byte compare each read every candidate in full, so together they "

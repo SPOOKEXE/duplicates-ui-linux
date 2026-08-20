@@ -71,6 +71,13 @@ int main() {
     size_t savedHash = 0;
     double nextSaveCheck = 0.0;
 
+    // The hash cache is written while the app runs, not only when it closes.
+    // Hashing terabytes and then being killed used to throw all of it away.
+    // Rewriting a large cache is not free, so it goes at a slower cadence than
+    // the session and only when something was actually added.
+    uint64_t savedCacheGeneration = 0;
+    double nextCacheSave = 60.0;
+
     while (!glfwWindowShouldClose(window)) {
         // Wait for input rather than spinning at vsync: the timeout only exists
         // so progress refreshes while a scan or an apply is running.
@@ -96,6 +103,14 @@ int main() {
         if (glfwGetTime() >= nextSaveCheck) {
             nextSaveCheck = glfwGetTime() + 2.0;
             saveSessionIfChanged(sessionFile, serializeSession(sessionFromState(state)), savedHash);
+        }
+
+        if (glfwGetTime() >= nextCacheSave) {
+            nextCacheSave = glfwGetTime() + 60.0;
+            const uint64_t generation = state.cache.generation();
+            if (generation != savedCacheGeneration && state.cache.save(cacheFile)) {
+                savedCacheGeneration = generation;
+            }
         }
     }
 

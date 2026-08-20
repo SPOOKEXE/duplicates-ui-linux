@@ -62,7 +62,7 @@ const char* rootLabel(const AppState& s, const FileEntry& f) {
 void drawGroupHeader(AppState& s, int groupIndex) {
     DupGroup& g = s.groups[groupIndex];
     const FileEntry& keeper = s.files[g.members[g.keeper].fileIndex];
-    const uint64_t reclaim = (g.members.size() - 1) * g.size;
+    const uint64_t reclaim = g.unique ? g.size : (g.members.size() - 1) * g.size;
 
     const bool open = s.expanded[groupIndex] != 0;
     if (ImGui::ArrowButton("##expand", open ? ImGuiDir_Down : ImGuiDir_Right)) {
@@ -75,7 +75,11 @@ void drawGroupHeader(AppState& s, int groupIndex) {
     ImGui::SameLine();
     ImGui::Text("%s", formatSize(g.size).c_str());
     ImGui::SameLine(140);
-    ImGui::TextColored(kDim, "x%zu", g.members.size());
+    if (g.unique) {
+        ImGui::TextColored(kWarn, "only");
+    } else {
+        ImGui::TextColored(kDim, "x%zu", g.members.size());
+    }
     ImGui::SameLine(190);
 
     const std::string name = keeper.path.substr(keeper.path.find_last_of('/') + 1);
@@ -98,16 +102,27 @@ void drawMemberRow(AppState& s, int groupIndex, int memberIndex) {
 
     ImGui::Indent(20.0f);
 
-    if (ImGui::RadioButton("##keep", isKeeper)) setKeeper(g, memberIndex);
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("keep this copy, and pin the choice");
+    // A unique file has no sibling to keep instead of it, so there is no keeper
+    // dot to offer: the only choice is whether to act on the file itself.
+    if (!g.unique) {
+        if (ImGui::RadioButton("##keep", isKeeper)) setKeeper(g, memberIndex);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("keep this copy, and pin the choice");
+        ImGui::SameLine();
+    }
 
-    ImGui::SameLine();
-    if (isKeeper) {
+    if (!g.unique && isKeeper) {
         ImGui::TextColored(kOk, "keep");
     } else {
         bool selected = m.selected;
         if (ImGui::Checkbox("##sel", &selected)) m.selected = selected;
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("remove this copy when you apply");
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip(g.unique ? "move this file when you apply; nothing else holds a copy"
+                                       : "remove this copy when you apply");
+        }
+        if (g.unique) {
+            ImGui::SameLine();
+            ImGui::TextColored(kWarn, "only copy");
+        }
     }
 
     const float pathStart = 110.0f;
@@ -208,9 +223,15 @@ void drawToolbar(AppState& s) {
     }
 
     ImGui::SameLine();
-    ImGui::TextColored(kDim, "  |  %s groups   %s extras   %s reclaimable",
-                       formatCount(s.totals.groups).c_str(), formatCount(s.totals.extras).c_str(),
-                       formatSize(s.totals.reclaimable).c_str());
+    if (s.totals.uniques > 0) {
+        ImGui::TextColored(kWarn, "  |  %s file(s) with no copy anywhere",
+                           formatCount(s.totals.uniques).c_str());
+    } else {
+        ImGui::TextColored(kDim, "  |  %s groups   %s extras   %s reclaimable",
+                           formatCount(s.totals.groups).c_str(),
+                           formatCount(s.totals.extras).c_str(),
+                           formatSize(s.totals.reclaimable).c_str());
+    }
 }
 
 }  // namespace
@@ -244,7 +265,9 @@ void drawResults(AppState& s, float reserveBottom) {
         if (!s.haveResults) {
             ImGui::TextColored(kDim, "run a scan to see duplicate groups here");
         } else if (s.groups.empty()) {
-            ImGui::TextColored(kDim, "no duplicates found in these directories");
+            ImGui::TextColored(kDim, s.pipeline.report == ReportMode::Uniques
+                                         ? "every file in these directories has a copy"
+                                         : "no duplicates found in these directories");
         } else {
             ImGui::TextColored(kDim, "no group matches the current filter");
         }

@@ -810,24 +810,229 @@ void testHashCache() {
     const std::string file = dir.path + "/cache.tsv";
 
     HashCache cache;
-    cache.insert(1, 2, 300, 400, 0xABCDEF);
+    cache.insert("/mnt/one/a.bin", 0, 300, 400, 0xABCDEF);
     CHECK(cache.save(file));
 
     HashCache reloaded;
     reloaded.load(file);
     uint64_t got = 0;
-    CHECK(reloaded.lookup(1, 2, 300, 400, got));
+    CHECK(reloaded.lookup("/mnt/one/a.bin", 0, 300, 400, got));
     CHECK_EQ(got, 0xABCDEF);
 
-    // Any change to the file's identity misses, which is the whole invalidation
-    // strategy: there is nothing to get wrong.
-    CHECK(!reloaded.lookup(1, 2, 300, 401, got));
-    CHECK(!reloaded.lookup(1, 2, 301, 400, got));
-    CHECK(!reloaded.lookup(1, 3, 300, 400, got));
+    // The validation the whole cache rests on: a file whose size or mtime moved
+    // is a different file as far as its contents go. Writing into a zip moves
+    // both, which is exactly the case this exists for.
+    CHECK(!reloaded.lookup("/mnt/one/a.bin", 0, 300, 401, got));
+    CHECK(!reloaded.lookup("/mnt/one/a.bin", 0, 301, 400, got));
+    CHECK(!reloaded.lookup("/mnt/two/a.bin", 0, 300, 400, got));
+    // One, not two: the first stale lookup erases the entry, so the second finds
+    // nothing to be stale about. A wrong path is an ordinary miss.
+    CHECK_EQ(reloaded.stale(), 1);
+
+    // A stale entry is dropped rather than left to be asked about again.
+    reloaded.insert("/mnt/one/a.bin", 0, 301, 400, 0x1234);
+    CHECK(reloaded.lookup("/mnt/one/a.bin", 0, 301, 400, got));
+    CHECK_EQ(got, 0x1234);
+
+    // A sampled hash is not a full hash, and must never be served as one.
+    HashCache variants;
+    variants.insert("/mnt/one/big.iso", 0, 900, 5, 0xFULL);
+    variants.insert("/mnt/one/big.iso", 1048576, 900, 5, 0xEULL);
+    CHECK(variants.lookup("/mnt/one/big.iso", 0, 900, 5, got));
+    CHECK_EQ(got, 0xF);
+    CHECK(variants.lookup("/mnt/one/big.iso", 1048576, 900, 5, got));
+    CHECK_EQ(got, 0xE);
+    CHECK(!variants.lookup("/mnt/one/big.iso", 65536, 900, 5, got));
+
+    // Paths are the key, so a path holding a tab has to survive the format.
+    HashCache odd;
+    odd.insert("/mnt/a\tb/c\nd", 0, 7, 8, 0x99);
+    const std::string oddFile = dir.path + "/odd.tsv";
+    CHECK(odd.save(oddFile));
+    HashCache oddBack;
+    oddBack.load(oddFile);
+    CHECK(oddBack.lookup("/mnt/a\tb/c\nd", 0, 7, 8, got));
+    CHECK_EQ(got, 0x99);
 
     HashCache empty;
     empty.load(dir.path + "/does-not-exist.tsv");
     CHECK_EQ(empty.size(), 0);
+
+    // A v1 file was keyed by device and inode. Those keys cannot be translated
+    // without stat-ing every file they name, so it is dropped, not misread.
+    const std::string v1 = dir.path + "/v1.tsv";
+    {
+        std::ofstream out(v1);
+        out << "duplicates-ui hash cache v1\n1\t2\t300\t400\t11259375\t1700000000\n";
+    }
+    HashCache old;
+    old.load(v1);
+    CHECK_EQ(old.size(), 0);
+}
+
+void testSampledHash() {
+    currentTest = "sampled-hash";
+    TempDir dir;
+    const std::string a = dir.path + "/a.bin";
+    const std::string b = dir.path + "/b.bin";
+    const uint64_t big = 4 * 1024 * 1024;
+
+    writeFile(a, repeat('s', static_cast<size_t>(big)));
+    writeFile(b, repeat('s', static_cast<size_t>(big)));
+
+    const uint64_t sample = 16 * 4096;
+    uint64_t ha = 0, hb = 0;
+    bool wholeA = false, wholeB = false;
+    std::atomic<uint64_t> bytes {0};
+
+    CHECK(hashSampled(a, big, sample, nullptr, ha, wholeA, &bytes));
+    CHECK(hashSampled(b, big, sample, nullptr, hb, wholeB, &bytes));
+    CHECK(!wholeA);
+    CHECK_EQ(ha, hb);
+    // The point of the row: a 4 MB file costs the sample, not the file.
+    CHECK_EQ(bytes.load(), 2 * sample);
+
+    // A difference in the very last bytes has to be caught, because an archive
+    // that grew is the common case. The final window ends on the final byte.
+    std::string tail = repeat('s', static_cast<size_t>(big));
+    tail[tail.size() - 1] = 'X';
+    writeFile(dir.path + "/tail.bin", tail);
+    uint64_t ht = 0;
+    bool wholeT = false;
+    CHECK(hashSampled(dir.path + "/tail.bin", big, sample, nullptr, ht, wholeT));
+    CHECK(ht != ha);
+
+    // A difference at the very start, likewise.
+    std::string head = repeat('s', static_cast<size_t>(big));
+    head[0] = 'X';
+    writeFile(dir.path + "/head.bin", head);
+    uint64_t hh = 0;
+    bool wholeH = false;
+    CHECK(hashSampled(dir.path + "/head.bin", big, sample, nullptr, hh, wholeH));
+    CHECK(hh != ha);
+
+    // A file inside the budget is read end to end, so the result is the ordinary
+    // full hash and the caller may cache and reuse it as one.
+    writeFile(dir.path + "/small.bin", repeat('q', 1000));
+    uint64_t hs = 0, hfull = 0;
+    bool wholeS = false;
+    CHECK(hashSampled(dir.path + "/small.bin", 1000, sample, nullptr, hs, wholeS));
+    CHECK(wholeS);
+    CHECK(hashFull(dir.path + "/small.bin", nullptr, hfull));
+    CHECK_EQ(hs, hfull);
+
+    CHECK(!hashSampled(dir.path + "/missing.bin", big, sample, nullptr, hs, wholeS));
+}
+
+void testSampledHashInPipeline() {
+    currentTest = "sampled-row";
+    TempDir dir;
+    const size_t big = 2 * 1024 * 1024;
+    writeFile(dir.path + "/a/same.bin", repeat('y', big));
+    writeFile(dir.path + "/b/same.bin", repeat('y', big));
+
+    // Same size, and identical everywhere the sampler looks, but different in
+    // between. The sampled row cannot tell them apart; the byte compare must.
+    //
+    // The offset is chosen to fall in the gap between two probes: with 16
+    // windows of 4096 bytes over 2 MB, window 5 ends at 701781 and window 6
+    // starts at 837222. This is the honest limit of a sampled hash, and the
+    // reason it is a filter rather than proof.
+    std::string other = repeat('y', big);
+    other[750000] = 'Z';
+    writeFile(dir.path + "/a/sneaky.bin", other);
+    writeFile(dir.path + "/b/sneaky.bin", repeat('y', big));
+
+    Pipeline p;
+    p.threads = 2;
+    p.rules = {
+        Rule {true, RuleKind::MinSize, {}, 1},
+        Rule {true, RuleKind::SampledHash, {}, 16 * 4096},
+        Rule {true, RuleKind::ExactBytes, {}, 0},
+    };
+    const ScanOutcome proven = scanPipeline(dir.path, p, ScopeFilters {});
+    // All four files are the same size and same sample, so the byte compare is
+    // what separates the odd one out: three identical, one alone.
+    CHECK_EQ(proven.groups.size(), 1);
+    const int g = findGroup(proven, "/a/same.bin");
+    CHECK(g >= 0);
+    if (g >= 0) CHECK_EQ(proven.groups[g].members.size(), 3);
+
+    // Without the byte compare the sampled row alone calls all four a match,
+    // which is exactly why the interface objects to that pipeline.
+    Pipeline weak = p;
+    weak.rules.pop_back();
+    const ScanOutcome guessed = scanPipeline(dir.path, weak, ScopeFilters {});
+    CHECK_EQ(guessed.groups.size(), 1);
+    if (!guessed.groups.empty()) CHECK_EQ(guessed.groups[0].members.size(), 4);
+
+    // The floor keeps a sample from shrinking below one page per window.
+    Pipeline tiny;
+    tiny.rules = {Rule {true, RuleKind::SampledHash, {}, 10}};
+    CHECK_EQ(compilePipeline(tiny).splits[0].number,
+             static_cast<uint64_t>(kSampleWindows) * 4096);
+}
+
+void testUniquesReport() {
+    currentTest = "uniques";
+    TempDir dir;
+    writeFile(dir.path + "/a/pair.bin", repeat('p', 5000));
+    writeFile(dir.path + "/b/pair.bin", repeat('p', 5000));
+    writeFile(dir.path + "/a/alone.bin", repeat('a', 5000));   // unique by content
+    writeFile(dir.path + "/b/odd.bin", repeat('o', 777));      // unique by size
+
+    Pipeline p;
+    p.threads = 2;
+    p.rules = {
+        Rule {true, RuleKind::MinSize, {}, 1},
+        Rule {true, RuleKind::HeadBytes, {}, 512},
+        Rule {true, RuleKind::ExactBytes, {}, 0},
+    };
+
+    const ScanOutcome dupes = scanPipeline(dir.path, p, ScopeFilters {});
+    CHECK_EQ(dupes.groups.size(), 1);
+
+    p.report = ReportMode::Uniques;
+    const ScanOutcome alone = scanPipeline(dir.path, p, ScopeFilters {});
+
+    // A file dropped alone by any row is unique, whether it fell out at the size
+    // row or survived to the byte compare and matched nothing.
+    CHECK_EQ(alone.groups.size(), 2);
+    CHECK(findGroup(alone, "/a/alone.bin") >= 0);
+    CHECK(findGroup(alone, "/b/odd.bin") >= 0);
+    CHECK(findGroup(alone, "/a/pair.bin") < 0);
+    for (const auto& g : alone.groups) {
+        CHECK(g.unique);
+        CHECK_EQ(g.members.size(), 1);
+    }
+
+    // Duplicates and uniques partition the input: nothing is in both, nothing is
+    // in neither.
+    CHECK_EQ(dupes.files.size(), 4);
+    CHECK_EQ(alone.groups.size() + 2 * dupes.groups.size(), alone.files.size());
+
+    // The one file is selectable, because a uniques run is there to be acted on,
+    // and it reclaims nothing, because removing it removes the data.
+    const Totals t = computeTotals(alone.groups, alone.files);
+    CHECK_EQ(t.uniques, 2);
+    CHECK_EQ(t.extras, 0);
+    CHECK_EQ(t.reclaimable, 0);
+    CHECK_EQ(t.selected, 2);
+
+    // Selection helpers must not treat the only copy as a keeper to protect.
+    std::vector<DupGroup> groups = alone.groups;
+    deselectAll(groups);
+    CHECK_EQ(computeTotals(groups, alone.files).selected, 0);
+    selectAllExtras(groups);
+    CHECK_EQ(computeTotals(groups, alone.files).selected, 2);
+    invertSelection(groups);
+    CHECK_EQ(computeTotals(groups, alone.files).selected, 0);
+
+    // And resolveKeepers, which exists to keep exactly one copy safe, must not
+    // quietly clear the selection when there is no second copy to fall back on.
+    selectAllExtras(groups);
+    resolveKeepers(groups, alone.files, TieBreak::OldestMtime);
+    CHECK_EQ(computeTotals(groups, alone.files).selected, 2);
 }
 
 // ---------------------------------------------------------------- actions
@@ -1126,6 +1331,9 @@ int main() {
     testPruneRemoved();
     testNormalizeRoots();
     testHashCache();
+    testSampledHash();
+    testSampledHashInPipeline();
+    testUniquesReport();
     testQuarantinePaths();
     testQuarantineAndRestore();
     testDeleteRun();

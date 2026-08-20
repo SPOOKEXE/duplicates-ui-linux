@@ -12,9 +12,12 @@ copies you do not want to keep.
   in the highest directory is the one that stays.
 - **Matching**: one ordered rule list you build yourself. Glob and regex filters
   in include or exclude mode, size bounds, filename and mtime keys, first N
-  bytes, a full content hash, a byte for byte comparison. Every row ticks on and
-  off and moves up and down, so cheap filters run first and the expensive proof
-  only ever sees what survived.
+  bytes, a sampled hash, a full content hash, a byte for byte comparison. Every
+  row ticks on and off and moves up and down, so cheap filters run first and the
+  expensive proof only ever sees what survived.
+- **Either answer**: the duplicates, or the files with no copy anywhere. A
+  uniques run offers the reversible move only, because there is no second copy
+  standing behind the one you are moving.
 - **Keepers**: one copy per group is protected and can never be selected. The
   priority order decides which, a tie-break rule settles copies that rank
   equally, and clicking any row's keep dot overrides both for that group.
@@ -22,8 +25,9 @@ copies you do not want to keep.
   runs are recorded and can be put back with one button.
 - **Safety**: nothing is touched until you press Apply and confirm, and every
   file is re-checked against what the scan saw immediately before it is removed.
-- **Speed**: hashing runs across threads and results are cached between runs, so
-  rescanning an unchanged tree costs almost nothing.
+- **Speed**: hashing runs across threads and results are cached by path between
+  runs, so rescanning an unchanged tree costs almost nothing. A sampled hash
+  reads a megabyte of a 200 GB archive instead of all of it.
 - **A log that says what happened**: the pipeline as it ran, what the walk found
   and skipped, what each row took in and handed on, every hardlink folded, and
   every file moved or deleted with the path it came from.
@@ -97,8 +101,8 @@ Two kinds of row live in it:
 - **drop** rows look at one file and keep or discard it: glob pattern, regex
   pattern, smallest size, largest size.
 - **split** rows need two files to mean anything, and cut the surviving
-  candidates into smaller sets: same filename, same mtime, first bytes, full
-  content hash, exact byte compare.
+  candidates into smaller sets: same filename, same mtime, first bytes, sampled
+  hash, full content hash, exact byte compare.
 
 They share a list because they commute: throwing a file away never changes
 whether two *other* files are copies. That is also why drop rows are applied
@@ -130,6 +134,27 @@ Three details worth knowing:
 A second row of the same kind has nothing left to do, so it is dropped and said
 so in the log. Rows you untick never reach the scan at all.
 
+### Duplicates or uniques
+
+**report** decides which half of the answer you get. Every file that enters the
+cascade either survives into a group of two or more, or is dropped alone by some
+row; those two sets are exactly the duplicates and the uniques, and they
+partition the input with nothing in both and nothing in neither.
+
+- **DUPLICATES** (default) lists files with at least one other copy.
+- **UNIQUES** lists the leftovers: files with no copy anywhere in the inputs.
+  Useful for "what is in this folder that my archive does not already have".
+
+A uniques run has no keeper, because there is no second copy to keep instead.
+So it offers the **reversible move only**: delete permanently is disabled, and
+the confirmation says in as many words that these files have no other copy. A
+file that could not be read is in neither list, because what is true of it is
+unknown and reporting it as having no copy would be a lie with consequences.
+
+This is a property of the whole pipeline rather than of one row. A row that kept
+its unmatched files would hand the next row nothing but singletons, and no row
+can split a singleton, so per-row it could only ever mean "stop here".
+
 ### Big files and slow disks
 
 The rows that read bytes report **bytes**, not files, because a file count is
@@ -138,7 +163,23 @@ at `0 / 365` for an hour and looks like a hang. Progress is emitted from inside
 each file's read loop, and the bar names the file currently being read, so a row
 grinding through one enormous archive still visibly moves.
 
-Two things to know when the tree is terabytes of large files:
+**Sampled hash** is the row for this case. It reads a fixed budget spread as
+sixteen windows running from the very first byte to the very last, so a 200 GB
+archive costs a megabyte instead of 200 GB. A file small enough to fit inside the
+budget is simply read end to end, which makes its result the ordinary full hash,
+and it is cached and reused as one.
+
+It is worth being exact about what it does not do. Hashing a file in chunks does
+not make the answer more unique: sixty-four bits is sixty-four bits however it
+was computed, so a sampled hash is *weaker* than a full one, not stronger. Two
+files can agree on every window and differ in between — the test suite contains
+exactly that file, with its one different byte placed in the gap between probe 5
+and probe 6. What sampling buys is speed, and the way to spend it is to put an
+exact byte compare after it: the sample throws out almost everything for almost
+no reading, and the compare proves what is left. The interface objects in red if
+a sampled hash is the last word.
+
+Two more things to know when the tree is terabytes of large files:
 
 - **Full content hash and exact byte compare each read every candidate in full**,
   so having both on reads everything twice. The hash only earns that when a
@@ -290,10 +331,22 @@ for dragging it, which is how priority is reordered.
   and through a temporary file so a crash cannot truncate it. A `v1` file from
   before the rule list is still read: its fixed cascade and exclude globs are
   turned into the equivalent rows, so upgrading loses nothing.
-- `$XDG_CACHE_HOME/duplicates-ui/hashes.tsv` maps `(device, inode, size, mtime)`
-  to a content hash. A file that has been touched simply misses and is
-  recomputed, so there is no invalidation logic to get wrong. Deleting it costs
-  time and nothing else.
+- `$XDG_CACHE_HOME/duplicates-ui/hashes.tsv` maps a **path** to a content hash,
+  alongside the size and mtime it had when the hash was taken. A lookup compares
+  both; if either moved, the entry is dropped and the file is read again. Adding
+  a file to a zip moves both, which is the case this exists for. There is no
+  other invalidation logic to get wrong, and deleting the file costs time and
+  nothing else.
+
+  Keyed by path rather than by `(device, inode)`, which is what it used to do. A
+  device number is handed out at mount time, so replugging an external disk
+  renumbered it and threw away every entry for terabytes of files. A path
+  survives that; a rename does not, and costs one re-read, which is the cheaper
+  mistake. A sampled hash is stored under its sample size so it can never be
+  served up as a full one.
+
+  It is written every minute while the app runs, not only when it closes, so
+  hours of hashing survive the app being killed.
 
 Scan results are deliberately not saved. They are large, they go stale the
 moment anything on disk changes, and rescanning with a warm cache is fast.

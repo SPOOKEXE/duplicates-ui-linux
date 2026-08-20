@@ -2,6 +2,8 @@
 
 #include <fnmatch.h>
 
+#include "hash.h"
+
 #include "util.h"
 
 namespace {
@@ -40,11 +42,13 @@ bool patternSetMatches(const std::vector<CompiledPattern>& patterns, PatternComb
 }  // namespace
 
 const char* const kRuleKindNames[kRuleKindCount] = {
-    "glob pattern",  "regex pattern", "smallest size", "largest size",     "same filename",
-    "same mtime",    "first bytes",   "full content hash", "exact byte compare"};
+    "glob pattern", "regex pattern",      "smallest size",      "largest size",
+    "same filename", "same mtime",        "first bytes",        "full content hash",
+    "exact byte compare", "sampled hash"};
 
 const char* const kPatternCombineNames[2] = {"OR", "AND"};
 const char* const kPatternSelectNames[2] = {"EXCLUDE", "INCLUDE"};
+const char* const kReportModeNames[2] = {"DUPLICATES", "UNIQUES"};
 
 const char* ruleKindName(RuleKind kind) {
     const int i = static_cast<int>(kind);
@@ -81,6 +85,10 @@ const char* ruleKindHint(RuleKind kind) {
         case RuleKind::ExactBytes:
             return "the only row that proves a match rather than strongly suggesting one\n"
                    "without it, an irreversible delete rests on a 64-bit hash";
+        case RuleKind::SampledHash:
+            return "reads this many bytes spread evenly from the first byte to the last\n"
+                   "a 200 GB archive costs a megabyte instead of 200 GB, at the price of\n"
+                   "being a filter rather than proof: follow it with an exact byte compare";
     }
     return "";
 }
@@ -113,6 +121,7 @@ CompiledPipeline compilePipeline(const Pipeline& p) {
     CompiledPipeline c;
     c.combine = p.combine;
     c.select = p.select;
+    c.report = p.report;
     c.threads = p.threads < 1 ? 1 : (p.threads > 16 ? 16 : p.threads);
 
     bool seen[kRuleKindCount] = {};
@@ -153,6 +162,14 @@ CompiledPipeline compilePipeline(const Pipeline& p) {
             case RuleKind::HeadBytes: {
                 Rule use = r;
                 if (use.number < 512) use.number = 512;
+                c.splits.push_back(use);
+                break;
+            }
+            case RuleKind::SampledHash: {
+                Rule use = r;
+                // Below a window per probe there is nothing left to spread.
+                const uint64_t floor = static_cast<uint64_t>(kSampleWindows) * 4096;
+                if (use.number < floor) use.number = floor;
                 c.splits.push_back(use);
                 break;
             }
@@ -204,10 +221,13 @@ std::string describePipeline(const CompiledPipeline& c) {
     for (const auto& r : c.splits) {
         out += ", ";
         if (r.kind == RuleKind::HeadBytes) {
-            out += "first " + std::to_string(r.number) + " bytes";
+            out += "first " + formatSize(r.number);
+        } else if (r.kind == RuleKind::SampledHash) {
+            out += formatSize(r.number) + " sampled";
         } else {
             out += ruleKindName(r.kind);
         }
     }
+    out += c.report == ReportMode::Uniques ? "  -> files with no copy" : "  -> duplicates";
     return out;
 }

@@ -145,12 +145,14 @@ void ScanEngine::run(std::vector<std::string> roots, ScopeFilters scope, Pipelin
     }
 
     const Totals totals = computeTotals(groups, files);
+    const uint64_t groupCount = groups.size();
     stats.groups = totals.groups;
     stats.extras = totals.extras;
     stats.reclaimable = totals.reclaimable;
     stats.errors = errorCount.load();
     stats.cancelled = cancelled;
     stats.cacheHits = cache ? cache->hits() : 0;
+    stats.cacheStale = cache ? cache->stale() : 0;
     stats.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
 
     {
@@ -169,10 +171,16 @@ void ScanEngine::run(std::vector<std::string> roots, ScopeFilters scope, Pipelin
     if (cancelled) {
         if (log) log->warn("scan cancelled after " + formatDuration(stats.seconds));
     } else {
-        note("scan finished: " + formatCount(stats.groups) + " group(s), " +
-             formatCount(stats.extras) + " extra(s), " + formatSize(stats.reclaimable) +
-             " reclaimable, read " + formatSize(stats.bytesRead) + " in " +
-             formatDuration(stats.seconds) + ", " + formatCount(stats.errors) + " error(s)");
+        if (pipe.report == ReportMode::Uniques) {
+            note("scan finished: " + formatCount(groupCount) +
+                 " file(s) with no copy anywhere, read " + formatSize(stats.bytesRead) + " in " +
+                 formatDuration(stats.seconds) + ", " + formatCount(stats.errors) + " error(s)");
+        } else {
+            note("scan finished: " + formatCount(stats.groups) + " group(s), " +
+                 formatCount(stats.extras) + " extra(s), " + formatSize(stats.reclaimable) +
+                 " reclaimable, read " + formatSize(stats.bytesRead) + " in " +
+                 formatDuration(stats.seconds) + ", " + formatCount(stats.errors) + " error(s)");
+        }
     }
     running_.store(false);
 }

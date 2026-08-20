@@ -162,8 +162,12 @@ void ActionQueue::run(std::vector<ActionItem> items, ActionKind kind,
         std::string err;
 
         // The keeper is checked first. If the copy that is supposed to survive
-        // is not there any more, nothing else in this row is safe to do.
-        if (!verifyUnchanged(item.keeper, item.keeperSize, item.keeperMtime, err)) {
+        // is not there any more, nothing else in this row is safe to do. An
+        // empty keeper means a uniques run, where by definition there is no
+        // other copy; only the reversible move is offered for those, and the
+        // interface refuses the delete.
+        if (!item.keeper.empty() &&
+            !verifyUnchanged(item.keeper, item.keeperSize, item.keeperMtime, err)) {
             row.state = ActionState::Failed;
             row.error = "the copy being kept has changed (" + err + ")";
         } else if (!verifyUnchanged(item.path, item.size, item.mtime, err)) {
@@ -201,12 +205,12 @@ void ActionQueue::run(std::vector<ActionItem> items, ActionKind kind,
         if (log) {
             if (row.state != ActionState::Done) {
                 log->error("failed: " + item.path + "  (" + row.error + ")");
-            } else if (kind == ActionKind::Delete) {
-                log->info("deleted: " + item.path + "  (" + formatSize(item.size) +
-                          ", keeping " + item.keeper + ")");
             } else {
-                log->info("moved: " + item.path + " -> " + row.dest + "  (" +
-                          formatSize(item.size) + ", keeping " + item.keeper + ")");
+                const std::string why =
+                    item.keeper.empty() ? ", no other copy" : ", keeping " + item.keeper;
+                log->info((kind == ActionKind::Delete ? "deleted: " + item.path
+                                                      : "moved: " + item.path + " -> " + row.dest) +
+                          "  (" + formatSize(item.size) + why + ")");
             }
         }
 

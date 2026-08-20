@@ -47,6 +47,10 @@ void resolveKeepers(std::vector<DupGroup>& groups, const std::vector<FileEntry>&
                     TieBreak tie) {
     for (auto& g : groups) {
         if (g.members.empty()) continue;
+        // A unique file has no second copy, so there is no keeper to choose and
+        // nothing to protect. Leaving its selection alone is the whole point:
+        // clearing it here would make a uniques report un-actionable.
+        if (g.unique) continue;
         if (g.keeper < 0 || g.keeper >= static_cast<int>(g.members.size())) g.keeper = 0;
 
         if (!g.userPinned) {
@@ -69,6 +73,7 @@ void resolveKeepers(std::vector<DupGroup>& groups, const std::vector<FileEntry>&
 }
 
 void setKeeper(DupGroup& g, int memberIndex) {
+    if (g.unique) return;
     if (memberIndex < 0 || memberIndex >= static_cast<int>(g.members.size())) return;
     if (memberIndex != g.keeper) {
         g.members[g.keeper].selected = true;
@@ -80,6 +85,12 @@ void setKeeper(DupGroup& g, int memberIndex) {
 
 void selectAllExtras(std::vector<DupGroup>& groups) {
     for (auto& g : groups) {
+        // Nothing in a unique group is an extra, so "select extras" means all of
+        // them: there is no copy being kept for them to be extra to.
+        if (g.unique) {
+            for (auto& m : g.members) m.selected = true;
+            continue;
+        }
         for (size_t i = 0; i < g.members.size(); ++i) {
             g.members[i].selected = (static_cast<int>(i) != g.keeper);
         }
@@ -95,7 +106,7 @@ void deselectAll(std::vector<DupGroup>& groups) {
 void invertSelection(std::vector<DupGroup>& groups) {
     for (auto& g : groups) {
         for (size_t i = 0; i < g.members.size(); ++i) {
-            if (static_cast<int>(i) == g.keeper) continue;
+            if (!g.unique && static_cast<int>(i) == g.keeper) continue;
             g.members[i].selected = !g.members[i].selected;
         }
     }
@@ -109,8 +120,13 @@ Totals computeTotals(const std::vector<DupGroup>& groups, const std::vector<File
     Totals t;
     t.groups = groups.size();
     for (const auto& g : groups) {
-        t.extras += g.members.size() - 1;
-        t.reclaimable += (g.members.size() - 1) * g.size;
+        // A unique file is not an extra and reclaims nothing: it is the only
+        // copy, so removing it frees space at the cost of the data itself.
+        if (!g.unique) {
+            t.extras += g.members.size() - 1;
+            t.reclaimable += (g.members.size() - 1) * g.size;
+        }
+        if (g.unique) ++t.uniques;
         for (size_t i = 0; i < g.members.size(); ++i) {
             if (!g.members[i].selected) continue;
             ++t.selected;
@@ -122,7 +138,9 @@ Totals computeTotals(const std::vector<DupGroup>& groups, const std::vector<File
 
 bool groupMatches(const DupGroup& g, const std::vector<FileEntry>& files, const GroupFilter& f) {
     if (g.size < f.minSize) return false;
-    if (static_cast<int>(g.members.size()) < f.minMembers) return false;
+    // The copies floor is about how many copies exist, which a unique file
+    // cannot satisfy and should not be judged by.
+    if (!g.unique && static_cast<int>(g.members.size()) < f.minMembers) return false;
     if (f.text.empty()) return true;
 
     const std::string needle = lowered(f.text);
@@ -135,7 +153,9 @@ bool groupMatches(const DupGroup& g, const std::vector<FileEntry>& files, const 
 const char* const kGroupSortNames[4] = {"reclaimable", "size", "copies", "path"};
 
 void sortGroups(std::vector<DupGroup>& groups, const std::vector<FileEntry>& files, GroupSort s) {
-    const auto reclaim = [](const DupGroup& g) { return (g.members.size() - 1) * g.size; };
+    const auto reclaim = [](const DupGroup& g) {
+        return g.unique ? g.size : (g.members.size() - 1) * g.size;
+    };
     const auto keeperPath = [&files](const DupGroup& g) -> const std::string& {
         return files[g.members[g.keeper].fileIndex].path;
     };
@@ -174,7 +194,9 @@ void pruneRemoved(std::vector<DupGroup>& groups, const std::vector<FileEntry>& f
         for (const auto& m : g.members) {
             if (removed.count(files[m.fileIndex].path) == 0) members.push_back(m);
         }
-        if (members.size() < 2) continue;  // nothing left to decide
+        // A unique row disappears the moment its one file goes; a duplicate group
+        // disappears when fewer than two copies are left to choose between.
+        if (members.size() < (g.unique ? 1u : 2u)) continue;
 
         g.members = std::move(members);
         g.keeper = 0;

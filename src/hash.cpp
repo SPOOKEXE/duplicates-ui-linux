@@ -255,6 +255,70 @@ bool hashFull(const std::string& path, const std::atomic<bool>* cancel, uint64_t
     return ok;
 }
 
+bool hashSampled(const std::string& path, uint64_t size, uint64_t sampleBytes,
+                 const std::atomic<bool>* cancel, uint64_t& out, bool& wholeFile,
+                 std::atomic<uint64_t>* bytesRead, const ChunkFn* onChunk) {
+    wholeFile = false;
+    if (sampleBytes == 0) return false;
+
+    // Reading the whole thing is both cheaper and stronger than seeking around
+    // inside it, so a file that fits in the budget is simply hashed in full.
+    if (size <= sampleBytes) {
+        wholeFile = true;
+        return hashFull(path, cancel, out, bytesRead, onChunk);
+    }
+
+    const int fd = ::open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return false;
+#ifdef POSIX_FADV_RANDOM
+    ::posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+#endif
+
+    const uint64_t window = std::max<uint64_t>(1, sampleBytes / kSampleWindows);
+    // Seeded with the size so two files of different lengths can never collide
+    // here even if every window they share happens to agree.
+    XxHash64 h;
+    h.update(&size, sizeof(size));
+
+    std::vector<unsigned char> buf(static_cast<size_t>(window));
+    bool ok = true;
+
+    for (int i = 0; i < kSampleWindows; ++i) {
+        if (cancel && cancel->load()) {
+            ok = false;
+            break;
+        }
+        // Spread so the first window starts at byte zero and the last one ends
+        // at the final byte: a difference in the tail is the common case an
+        // append-only archive produces.
+        const uint64_t span = size - window;
+        const uint64_t offset = span * static_cast<uint64_t>(i) /
+                                static_cast<uint64_t>(kSampleWindows - 1);
+
+        size_t got = 0;
+        while (got < buf.size()) {
+            const ssize_t n = ::pread(fd, buf.data() + got, buf.size() - got,
+                                      static_cast<off_t>(offset + got));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                ok = false;
+                break;
+            }
+            if (n == 0) break;
+            got += static_cast<size_t>(n);
+        }
+        if (!ok) break;
+
+        h.update(buf.data(), got);
+        if (bytesRead) bytesRead->fetch_add(static_cast<uint64_t>(got));
+        if (onChunk) (*onChunk)(static_cast<uint64_t>(got));
+    }
+
+    ::close(fd);
+    if (ok) out = h.digest();
+    return ok;
+}
+
 bool sameContents(const std::string& a, const std::string& b, const std::atomic<bool>* cancel,
                   bool& error, std::atomic<uint64_t>* bytesRead, const ChunkFn* onChunk) {
     error = false;
