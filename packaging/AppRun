@@ -1,0 +1,5 @@
+#!/bin/sh
+# Entry point inside the AppImage. Nothing external is needed at runtime: the
+# hashing and the file operations all happen in process.
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "${HERE}/usr/bin/duplicates-ui" "$@"

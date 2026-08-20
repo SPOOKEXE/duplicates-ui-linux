@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=duplicates-ui
+GenericName=Duplicate file finder
+Comment=Find duplicate files across directories and choose which copy to keep
+Exec=duplicates-ui
+Icon=duplicates-ui
+Categories=Utility;FileTools;
+Terminal=false
+Keywords=duplicate;dedupe;files;cleanup;disk;space;
