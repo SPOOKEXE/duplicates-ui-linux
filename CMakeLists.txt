@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(duplicates-ui LANGUAGES C CXX)
+project(duplicates-ui VERSION 0.1.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -74,6 +74,10 @@ add_executable(duplicates-ui
     src/dir_browser.cpp)
 target_link_libraries(duplicates-ui PRIVATE dupcore imgui)
 target_compile_options(duplicates-ui PRIVATE -Wall -Wextra)
+# So a built binary can say what it is. A release artifact that cannot be asked
+# its version is a release artifact you cannot tell apart from any other.
+target_compile_definitions(duplicates-ui PRIVATE
+    DUPLICATES_UI_VERSION="${PROJECT_VERSION}")
 
 enable_testing()
 add_executable(unit-tests tests/unit_tests.cpp)

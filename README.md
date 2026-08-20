@@ -48,12 +48,21 @@ chmod +x duplicates-ui-x86_64.AppImage
 # or the plain executable
 chmod +x duplicates-ui-x86_64
 ./duplicates-ui-x86_64
+
+# either one can say what it is
+./duplicates-ui-x86_64 --version
 ```
 
 Release builds link libstdc++ and libgcc statically and GLFW loads X11 at
 runtime, so the only hard requirements are glibc 2.35 or newer and the system's
 OpenGL libraries. Nothing external is called at runtime: the hashing and the
 file operations all happen in process.
+
+The published artifacts are built on Ubuntu 22.04 on purpose: a binary links
+against the glibc it was built against, so building on a newer distribution
+would raise that floor and the result would refuse to start on older ones.
+Building the same recipe locally gives you your own machine's floor, which is
+fine for your own machine and not fine for handing out.
 
 ## Build
 

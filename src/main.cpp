@@ -11,6 +11,10 @@
 #include "session.h"
 #include "ui.h"
 
+#ifndef DUPLICATES_UI_VERSION
+#define DUPLICATES_UI_VERSION "0.0.0-dev"
+#endif
+
 namespace {
 
 void glfwErrorCallback(int code, const char* desc) {
@@ -27,7 +31,29 @@ void dropCallback(GLFWwindow* window, int count, const char** paths) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    // The only two arguments there are. Everything else this program does is a
+    // decision the user has to see on screen before it happens.
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--version" || arg == "-v") {
+            std::printf("duplicates-ui %s\n", DUPLICATES_UI_VERSION);
+            return 0;
+        }
+        if (arg == "--help" || arg == "-h") {
+            std::printf(
+                "duplicates-ui %s\n"
+                "Find duplicate files across directories and choose which copy to keep.\n\n"
+                "usage: duplicates-ui [--version] [--help]\n\n"
+                "Everything else is set in the window: input directories, the rule\n"
+                "pipeline, and what to do with what it finds.\n",
+                DUPLICATES_UI_VERSION);
+            return 0;
+        }
+        std::fprintf(stderr, "unknown argument: %s (try --help)\n", arg.c_str());
+        return 2;
+    }
+
     glfwSetErrorCallback(glfwErrorCallback);
     if (!glfwInit()) {
         std::fprintf(stderr, "failed to initialise glfw\n");

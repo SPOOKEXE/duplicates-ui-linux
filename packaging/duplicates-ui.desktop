@@ -8,3 +8,4 @@ Icon=duplicates-ui
 Categories=Utility;FileTools;
 Terminal=false
 Keywords=duplicate;dedupe;files;cleanup;disk;space;
+X-AppImage-Version=0.1.0
