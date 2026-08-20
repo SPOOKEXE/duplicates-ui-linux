@@ -126,6 +126,14 @@ void drawInputs(AppState& s) {
 
 namespace {
 
+// The status lines under the rule list are full sentences and the panel is half
+// the window wide, so they wrap rather than running off the edge.
+void wrappedColored(const ImVec4& colour, const char* text) {
+    ImGui::PushStyleColor(ImGuiCol_Text, colour);
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopStyleColor();
+}
+
 // A new row of each kind starts with the number that makes it useful straight
 // away, so adding one never means also remembering to set a size.
 Rule freshRule(RuleKind kind) {
@@ -303,22 +311,32 @@ void drawPipeline(AppState& s) {
     }
 
     const CompiledPipeline compiled = compilePipeline(s.pipeline);
+    bool proves = false, hashes = false;
+    for (const auto& r : compiled.splits) {
+        if (r.kind == RuleKind::ExactBytes) proves = true;
+        if (r.kind == RuleKind::FullHash) hashes = true;
+    }
+
     if (compiled.splits.empty()) {
-        ImGui::TextColored(kBad, "no matching row: files would be grouped on size alone");
+        wrappedColored(kBad, "no matching row: files would be grouped on size alone");
     } else if (!compiled.problems.empty()) {
-        ImGui::TextColored(kWarn, "%s", compiled.problems.front().c_str());
+        wrappedColored(kWarn, compiled.problems.front().c_str());
+    } else if (!proves) {
+        wrappedColored(kWarn,
+                       "without an exact byte compare, an irreversible delete rests on a 64-bit "
+                       "hash");
     } else {
-        bool proves = false;
-        for (const auto& r : compiled.splits) {
-            if (r.kind == RuleKind::ExactBytes) proves = true;
-        }
-        if (!proves) {
-            ImGui::TextColored(kWarn,
-                               "without an exact byte compare, an irreversible delete rests on a "
-                               "64-bit hash");
-        } else {
-            ImGui::TextColored(kDim, "%s", describePipeline(compiled).c_str());
-        }
+        wrappedColored(kDim, describePipeline(compiled).c_str());
+    }
+
+    // Both rows read every surviving candidate in full, so together they read it
+    // twice. On a tree of large files that is the difference between an hour and
+    // two, and the hash only earns its place when a bucket holds more than a pair.
+    if (proves && hashes) {
+        wrappedColored(kWarn,
+                       "hash and byte compare each read every candidate in full, so together they "
+                       "read it twice; dropping the hash halves the reading and still proves "
+                       "every match");
     }
 
     ImGui::Separator();

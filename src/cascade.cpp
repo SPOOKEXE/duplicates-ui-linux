@@ -71,6 +71,11 @@ std::string basenameOf(const std::string& path) {
     return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
+// One emit per this many bytes read, across all workers. Frequent enough that a
+// single huge file still shows movement, rare enough that the UI is not woken
+// thousands of times a second.
+constexpr uint64_t kPulseBytes = 64u << 20;
+
 // Progress and error reporting shared by the worker threads.
 struct Reporter {
     const CascadeHooks& hooks;
@@ -78,16 +83,29 @@ struct Reporter {
     CascadeProgress p;
     std::atomic<uint64_t> bytes {0};
     std::atomic<uint64_t> done {0};
+    std::atomic<uint64_t> sincePulse {0};
+    uint64_t stageBase = 0;   // bytes already read when this row started
+    uint64_t tickStep = 64;   // emit every this many finished files
 
     explicit Reporter(const CascadeHooks& h) : hooks(h) {}
 
-    void stage(Stage s, uint64_t total, uint64_t candidates) {
+    // bytesTotal is what this row expects to read, and 0 when it reads nothing,
+    // in which case the UI falls back to counting files.
+    void stage(Stage s, uint64_t total, uint64_t candidates, uint64_t bytesTotal = 0) {
         std::lock_guard<std::mutex> lock(mutex);
         p.stage = s;
         p.total = total;
         p.candidates = candidates;
         p.done = 0;
+        p.current.clear();
+        p.stageBytesTotal = bytesTotal;
+        p.stageBytesDone = 0;
         done.store(0);
+        sincePulse.store(0);
+        stageBase = bytes.load();
+        // A fixed step of 64 leaves a few hundred large files reporting nothing
+        // at all, so it scales down with the work rather than being a constant.
+        tickStep = total > 3200 ? 64 : std::max<uint64_t>(1, total / 50);
         emitLocked();
     }
 
@@ -95,18 +113,43 @@ struct Reporter {
     // hashed file would spend more time in the UI than in the I/O.
     void tick() {
         const uint64_t n = done.fetch_add(1) + 1;
-        if (n % 64 != 0) return;
+        if (n % tickStep != 0) return;
         std::lock_guard<std::mutex> lock(mutex);
         p.done = n;
-        p.bytesRead = bytes.load();
+        updateBytesLocked();
+        emitLocked();
+    }
+
+    // Called from inside a file's read loop, so a row spending an hour on one
+    // file still reports movement.
+    void pulse(uint64_t justRead) {
+        if (sincePulse.fetch_add(justRead) + justRead < kPulseBytes) return;
+        sincePulse.store(0);
+        std::lock_guard<std::mutex> lock(mutex);
+        p.done = done.load();
+        updateBytesLocked();
+        emitLocked();
+    }
+
+    void setCurrent(const std::string& path) {
+        std::lock_guard<std::mutex> lock(mutex);
+        p.current = path;
+        p.done = done.load();
+        updateBytesLocked();
         emitLocked();
     }
 
     void flush() {
         std::lock_guard<std::mutex> lock(mutex);
         p.done = done.load();
-        p.bytesRead = bytes.load();
+        p.current.clear();
+        updateBytesLocked();
         emitLocked();
+    }
+
+    void updateBytesLocked() {
+        p.bytesRead = bytes.load();
+        p.stageBytesDone = p.bytesRead - stageBase;
     }
 
     void error(const std::string& message) {
@@ -129,7 +172,7 @@ struct Reporter {
 // as a split rather than as a wrong group.
 std::vector<Bucket> exactSplit(const Bucket& bucket, const std::vector<FileEntry>& files,
                                const CascadeHooks& hooks, Reporter& rep,
-                               std::atomic<uint64_t>& errors) {
+                               std::atomic<uint64_t>& errors, const ChunkFn& onChunk) {
     std::vector<Bucket> out;
     Bucket remaining = bucket;
 
@@ -142,8 +185,9 @@ std::vector<Bucket> exactSplit(const Bucket& bucket, const std::vector<FileEntry
 
         for (size_t i = 1; i < remaining.size(); ++i) {
             bool err = false;
+            rep.setCurrent(files[remaining[i]].path);
             if (sameContents(files[pivot].path, files[remaining[i]].path, hooks.cancel, err,
-                             &rep.bytes)) {
+                             &rep.bytes, &onChunk)) {
                 match.push_back(remaining[i]);
             } else if (err) {
                 // Unreadable now means it cannot be compared, so it leaves the
@@ -201,6 +245,9 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
                                  const CascadeHooks& hooks) {
     Reporter rep(hooks);
     const auto cancelled = [&] { return hooks.cancel && hooks.cancel->load(); };
+    // One callback shared by every reader, so progress moves inside a single
+    // multi-gigabyte file rather than only when it finishes.
+    const ChunkFn onChunk = [&](uint64_t n) { rep.pulse(n); };
 
     // Size, always first and never a row. Free, because the walk already called
     // lstat, and it is what makes every later row affordable.
@@ -220,7 +267,9 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
     // coincidence dies.
     const auto runHeadBytes = [&](uint64_t headSize, uint64_t& errors, uint64_t& cacheHits) {
         std::vector<int> candidates = flatten(buckets);
-        rep.stage(Stage::HeadBytes, candidates.size(), candidates.size());
+        uint64_t expected = 0;
+        for (int i : candidates) expected += std::min<uint64_t>(files[i].size, headSize);
+        rep.stage(Stage::HeadBytes, candidates.size(), candidates.size(), expected);
         std::vector<char> bad(files.size(), 0);
         std::atomic<uint64_t> failed {0}, hits {0};
 
@@ -275,7 +324,9 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
         for (int i : flatten(buckets)) {
             if (!files[i].hashed) candidates.push_back(i);
         }
-        rep.stage(Stage::FullHash, candidates.size(), countIn(buckets));
+        uint64_t expected = 0;
+        for (int i : candidates) expected += files[i].size;
+        rep.stage(Stage::FullHash, candidates.size(), countIn(buckets), expected);
         std::vector<char> bad(files.size(), 0);
         std::atomic<uint64_t> failed {0}, hits {0};
 
@@ -288,7 +339,14 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
                 files[i].fullHash = h;
                 files[i].hashed = true;
                 hits.fetch_add(1);
-            } else if (hashFull(f.path, hooks.cancel, h, &rep.bytes)) {
+                rep.tick();
+                return;
+            }
+
+            // Named before it is read, not after: on a tree of large archives
+            // this is the only thing that says which file is taking the hour.
+            rep.setCurrent(f.path);
+            if (hashFull(f.path, hooks.cancel, h, &rep.bytes, &onChunk)) {
                 files[i].fullHash = h;
                 files[i].hashed = true;
                 if (hooks.cache) hooks.cache->insert(f.dev, f.ino, f.size, f.mtime, h);
@@ -314,12 +372,19 @@ std::vector<DupGroup> runCascade(std::vector<FileEntry>& files, const CompiledPi
 
     // The only row that can prove a match rather than strongly suggest one.
     const auto runExactCompare = [&](uint64_t& errors) {
-        rep.stage(Stage::ExactCompare, buckets.size(), countIn(buckets));
+        // Each bucket compares its first member against the others, and a pair
+        // read costs both files, so a bucket of k identical files of size S
+        // reads 2S(k-1). An early mismatch only makes the row finish sooner.
+        uint64_t expected = 0;
+        for (const auto& b : buckets) {
+            if (b.size() >= 2) expected += 2 * files[b[0]].size * (b.size() - 1);
+        }
+        rep.stage(Stage::ExactCompare, buckets.size(), countIn(buckets), expected);
         std::vector<std::vector<Bucket>> perBucket(buckets.size());
         std::atomic<uint64_t> failed {0};
 
         parallelFor(buckets.size(), pipe.threads, hooks.cancel, [&](size_t k) {
-            perBucket[k] = exactSplit(buckets[k], files, hooks, rep, failed);
+            perBucket[k] = exactSplit(buckets[k], files, hooks, rep, failed, onChunk);
             rep.tick();
         });
         rep.flush();

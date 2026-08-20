@@ -130,6 +130,30 @@ Three details worth knowing:
 A second row of the same kind has nothing left to do, so it is dropped and said
 so in the log. Rows you untick never reach the scan at all.
 
+### Big files and slow disks
+
+The rows that read bytes report **bytes**, not files, because a file count is
+useless as a progress bar when one file is 200 GB and the next is 40 MB: it sits
+at `0 / 365` for an hour and looks like a hang. Progress is emitted from inside
+each file's read loop, and the bar names the file currently being read, so a row
+grinding through one enormous archive still visibly moves.
+
+Two things to know when the tree is terabytes of large files:
+
+- **Full content hash and exact byte compare each read every candidate in full**,
+  so having both on reads everything twice. The hash only earns that when a
+  bucket holds more than a pair: for a pair, hashing both files costs exactly
+  what comparing them costs, and the comparison also proves the match. On big
+  archives, delete the **full content hash** row and keep the compare. The
+  interface says so when both are on.
+- **Threads help on an SSD and hurt on one spinning disk.** Four workers pulling
+  four sequential streams off a single drive turn a sequential read into a seek
+  storm. Set threads to the number of independent disks you are scanning, not
+  the number of cores.
+
+The hash cache does not change this arithmetic. It makes the hash row free on a
+rescan, but nothing caches a byte comparison, so the compare re-reads either way.
+
 ### Pattern rows
 
 Glob and regex rows are the same row wearing a different hat: click the kind

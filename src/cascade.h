@@ -38,6 +38,13 @@ struct CascadeProgress {
     uint64_t total = 0;
     uint64_t candidates = 0;  // files still in the running after the last row
     uint64_t bytesRead = 0;
+
+    // Bytes, rather than files, for the rows that read them. A file count is
+    // useless as a progress bar when one file is 200 GB and the next is 40 MB:
+    // it sits at 0/365 for an hour and looks like a hang.
+    uint64_t stageBytesDone = 0;
+    uint64_t stageBytesTotal = 0;
+    std::string current;  // the file a worker started most recently
 };
 
 struct CascadeHooks {

@@ -226,7 +226,7 @@ bool hashHead(const std::string& path, uint64_t limit, uint64_t& out) {
 }
 
 bool hashFull(const std::string& path, const std::atomic<bool>* cancel, uint64_t& out,
-              std::atomic<uint64_t>* bytesRead) {
+              std::atomic<uint64_t>* bytesRead, const ChunkFn* onChunk) {
     const int fd = openSequential(path);
     if (fd < 0) return false;
 
@@ -247,6 +247,7 @@ bool hashFull(const std::string& path, const std::atomic<bool>* cancel, uint64_t
         if (n == 0) break;
         h.update(buf.data(), static_cast<size_t>(n));
         if (bytesRead) bytesRead->fetch_add(static_cast<uint64_t>(n));
+        if (onChunk) (*onChunk)(static_cast<uint64_t>(n));
     }
 
     ::close(fd);
@@ -255,7 +256,7 @@ bool hashFull(const std::string& path, const std::atomic<bool>* cancel, uint64_t
 }
 
 bool sameContents(const std::string& a, const std::string& b, const std::atomic<bool>* cancel,
-                  bool& error, std::atomic<uint64_t>* bytesRead) {
+                  bool& error, std::atomic<uint64_t>* bytesRead, const ChunkFn* onChunk) {
     error = false;
     const int fa = openSequential(a);
     if (fa < 0) {
@@ -294,6 +295,7 @@ bool sameContents(const std::string& a, const std::string& b, const std::atomic<
         }
         if (na == 0) break;
         if (bytesRead) bytesRead->fetch_add(static_cast<uint64_t>(na) * 2);
+        if (onChunk) (*onChunk)(static_cast<uint64_t>(na) * 2);
         if (std::memcmp(bufA.data(), bufB.data(), static_cast<size_t>(na)) != 0) {
             same = false;
             break;

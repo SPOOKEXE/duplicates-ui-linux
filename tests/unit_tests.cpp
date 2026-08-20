@@ -4,6 +4,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cstdlib>
 
 #include <cstdint>
@@ -586,6 +587,89 @@ void testLogBuffer() {
     CHECK_EQ(log.count(LogLevel::Warn), 0);
 }
 
+void testChunkProgressCallbacks() {
+    currentTest = "chunk-progress";
+    TempDir dir;
+    // Bigger than the 1 MB read buffer, so a single file spans several reads.
+    // This is the whole point: without a per-chunk callback, a caller hears
+    // nothing at all until a multi-gigabyte file reaches EOF.
+    writeFile(dir.path + "/a.bin", repeat('c', 3 * 1024 * 1024 + 77));
+    writeFile(dir.path + "/b.bin", repeat('c', 3 * 1024 * 1024 + 77));
+
+    uint64_t calls = 0, reported = 0;
+    const ChunkFn onChunk = [&](uint64_t n) {
+        ++calls;
+        reported += n;
+    };
+
+    uint64_t h = 0;
+    std::atomic<uint64_t> bytes {0};
+    CHECK(hashFull(dir.path + "/a.bin", nullptr, h, &bytes, &onChunk));
+    CHECK(calls >= 3);
+    CHECK_EQ(reported, 3u * 1024 * 1024 + 77);
+    CHECK_EQ(bytes.load(), reported);
+
+    calls = 0;
+    reported = 0;
+    bytes.store(0);
+    bool err = false;
+    CHECK(sameContents(dir.path + "/a.bin", dir.path + "/b.bin", nullptr, err, &bytes, &onChunk));
+    CHECK(!err);
+    CHECK(calls >= 3);
+    // A comparison reads both sides, so it reports twice the file's size.
+    CHECK_EQ(reported, 2u * (3u * 1024 * 1024 + 77));
+
+    // The callback is optional, and omitting it must not change the answer.
+    uint64_t plain = 0;
+    CHECK(hashFull(dir.path + "/a.bin", nullptr, plain));
+    CHECK_EQ(plain, h);
+}
+
+void testCascadeReportsBytesAndCurrentFile() {
+    currentTest = "byte-progress";
+    TempDir dir;
+    writeFile(dir.path + "/a/big.bin", repeat('v', 400000));
+    writeFile(dir.path + "/b/big.bin", repeat('v', 400000));
+
+    Pipeline p;
+    p.threads = 1;
+    p.rules = {
+        Rule {true, RuleKind::MinSize, {}, 1},
+        Rule {true, RuleKind::HeadBytes, {}, 512},
+        Rule {true, RuleKind::FullHash, {}, 0},
+        Rule {true, RuleKind::ExactBytes, {}, 0},
+    };
+    const CompiledPipeline compiled = compilePipeline(p);
+
+    WalkStats walk;
+    WalkHooks wh;
+    std::vector<FileEntry> files =
+        walkRoots({dir.path + "/a", dir.path + "/b"}, ScopeFilters {}, compiled, wh, walk);
+
+    // Every row that reads bytes has to declare how many, or the progress bar
+    // falls back to counting files and freezes on a large one.
+    uint64_t sawFullHashBytes = 0, sawExactBytes = 0;
+    bool namedAFile = false;
+    CascadeHooks ch;
+    // The peak, not the last: a row emits once more when it finishes, with the
+    // totals cleared because there is nothing left to read.
+    ch.onProgress = [&](const CascadeProgress& prog) {
+        if (prog.stage == Stage::FullHash) {
+            sawFullHashBytes = std::max(sawFullHashBytes, prog.stageBytesTotal);
+        }
+        if (prog.stage == Stage::ExactCompare) {
+            sawExactBytes = std::max(sawExactBytes, prog.stageBytesTotal);
+        }
+        if (!prog.current.empty()) namedAFile = true;
+    };
+
+    const std::vector<DupGroup> groups = runCascade(files, compiled, ch);
+    CHECK_EQ(groups.size(), 1);
+    CHECK_EQ(sawFullHashBytes, 800000);          // both files, read in full
+    CHECK_EQ(sawExactBytes, 800000);             // one pair, both sides
+    CHECK(namedAFile);
+}
+
 // ---------------------------------------------------------------- priority
 
 FileEntry makeEntry(const std::string& path, int rootIndex, int64_t mtime) {
@@ -1035,6 +1119,8 @@ int main() {
     testRuleOrderAndCompile();
     testSizeBounds();
     testLogBuffer();
+    testChunkProgressCallbacks();
+    testCascadeReportsBytesAndCurrentFile();
     testPriorityAndTieBreak();
     testSelectionOps();
     testPruneRemoved();

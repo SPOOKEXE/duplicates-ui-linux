@@ -37,7 +37,22 @@ void drawTopBar(AppState& s) {
     if (scanning) {
         ImGui::TextColored(kCyan, "%s", stageName(p.stage));
         ImGui::SameLine();
-        if (p.total > 0) {
+        // Bytes when the row reads them: a file count sits still for an hour on
+        // one huge archive and reads as a hang. Files otherwise.
+        if (p.stageBytesTotal > 0) {
+            const float frac = static_cast<float>(static_cast<double>(p.stageBytesDone) /
+                                                  static_cast<double>(p.stageBytesTotal));
+            char overlay[80];
+            std::snprintf(overlay, sizeof(overlay), "%s / %s",
+                          formatSize(p.stageBytesDone).c_str(),
+                          formatSize(p.stageBytesTotal).c_str());
+            ImGui::SetNextItemWidth(240);
+            ImGui::ProgressBar(frac > 1.0f ? 1.0f : frac, ImVec2(240, 0), overlay);
+            ImGui::SameLine();
+            ImGui::TextColored(kDim, "  %s / %s files   %s candidates",
+                               formatCount(p.done).c_str(), formatCount(p.total).c_str(),
+                               formatCount(p.candidates).c_str());
+        } else if (p.total > 0) {
             const float frac = static_cast<float>(static_cast<double>(p.done) /
                                                   static_cast<double>(p.total));
             char overlay[64];
@@ -45,12 +60,21 @@ void drawTopBar(AppState& s) {
                           formatCount(p.total).c_str());
             ImGui::SetNextItemWidth(240);
             ImGui::ProgressBar(frac, ImVec2(240, 0), overlay);
+            ImGui::SameLine();
+            ImGui::TextColored(kDim, "  %s candidates   %s read",
+                               formatCount(p.candidates).c_str(),
+                               formatSize(p.bytesRead).c_str());
         } else {
             ImGui::TextDisabled("%s files", formatCount(p.done).c_str());
+            ImGui::SameLine();
+            ImGui::TextColored(kDim, "  %s candidates   %s read",
+                               formatCount(p.candidates).c_str(),
+                               formatSize(p.bytesRead).c_str());
         }
-        ImGui::SameLine();
-        ImGui::TextColored(kDim, "  %s candidates   %s read", formatCount(p.candidates).c_str(),
-                           formatSize(p.bytesRead).c_str());
+
+        if (!p.current.empty()) {
+            ImGui::TextColored(kDim, "reading %s", p.current.c_str());
+        }
     } else if (s.haveResults) {
         const Totals& t = s.totals;
         ImGui::TextColored(kDim,
@@ -285,12 +309,12 @@ void drawUi(AppState& s) {
 
     // Inputs on the left, everything that shapes the scan on the right.
     const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-    ImGui::BeginChild("inputs", ImVec2(half, 265));
+    ImGui::BeginChild("inputs", ImVec2(half, 300));
     drawInputs(s);
     ImGui::EndChild();
 
     ImGui::SameLine();
-    ImGui::BeginChild("pipeline", ImVec2(half, 265));
+    ImGui::BeginChild("pipeline", ImVec2(half, 300));
     drawPipeline(s);
     ImGui::EndChild();
 
