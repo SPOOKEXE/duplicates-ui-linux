@@ -32,7 +32,7 @@ void drawInputs(AppState& s) {
     ImGui::SameLine();
     ImGui::TextColored(kDim, " priority order, the first one keeps its copy");
 
-    ImGui::BeginChild("rootlist", ImVec2(0, 120), true);
+    ImGui::BeginChild("rootlist", ImVec2(0, 190), true);
 
     int removeAt = -1;
     int moveFrom = -1, moveTo = -1;
