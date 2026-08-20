@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -156,6 +157,39 @@ std::string timestampNow() {
     char buf[32];
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H-%M-%S", &tm);
     return buf;
+}
+
+bool openInFileManager(const std::string& path) {
+    if (path.empty()) return false;
+
+    // Forked rather than handed to system(): a path is user data, and a path
+    // containing a quote or a semicolon must never become part of a shell
+    // command. execlp passes it as one argument, whatever is in it.
+    const pid_t first = ::fork();
+    if (first < 0) return false;
+    if (first == 0) {
+        // Fork again and let the middle process exit immediately, so the
+        // grandchild is reparented to init and nothing here has to reap it.
+        // The UI never waits on a file manager it does not own.
+        const pid_t second = ::fork();
+        if (second == 0) {
+            ::setsid();
+            ::execlp("xdg-open", "xdg-open", path.c_str(), static_cast<char*>(nullptr));
+            ::_exit(127);  // xdg-open is missing; the parent cannot tell, and should not stall
+        }
+        ::_exit(second < 0 ? 1 : 0);
+    }
+
+    int status = 0;
+    while (::waitpid(first, &status, 0) < 0 && errno == EINTR) {
+    }
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+bool openContainingFolder(const std::string& path) {
+    const size_t slash = path.find_last_of('/');
+    if (slash == std::string::npos) return openInFileManager(path);
+    return openInFileManager(slash == 0 ? "/" : path.substr(0, slash));
 }
 
 std::string escapeField(const std::string& s) {

@@ -9,6 +9,8 @@
 
 #include "runs.h"
 
+class Log;
+
 // One planned removal, carrying everything needed to prove at apply time that
 // the file is still exactly what the scan saw.
 struct ActionItem {
@@ -81,7 +83,9 @@ public:
     ActionQueue(const ActionQueue&) = delete;
     ActionQueue& operator=(const ActionQueue&) = delete;
 
-    void start(std::vector<ActionItem> items, ActionKind kind, std::string quarantineRoot);
+    // The log is borrowed, not owned, and must outlive the queue.
+    void start(std::vector<ActionItem> items, ActionKind kind, std::string quarantineRoot,
+               Log* log);
     void cancel();
     bool running() const;
 
@@ -91,7 +95,7 @@ public:
     bool takeSummary(RunSummary& out);
 
 private:
-    void run(std::vector<ActionItem> items, ActionKind kind, std::string quarantineRoot);
+    void run(std::vector<ActionItem> items, ActionKind kind, std::string quarantineRoot, Log* log);
 
     mutable std::mutex mutex_;
     std::thread thread_;

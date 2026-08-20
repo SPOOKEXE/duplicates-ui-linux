@@ -35,22 +35,79 @@ int clampInt(const std::string& s, int lo, int hi, int fallback) {
     return (v >= lo && v <= hi) ? v : fallback;
 }
 
+// What a v1 file recorded, held until the whole file is read so it can be
+// turned into a pipeline in one go rather than a rule at a time.
+struct LegacyV1 {
+    bool seen = false;
+    uint64_t minSize = 1;
+    std::string excludeGlobs;
+    bool sameName = false;
+    bool sameMtime = false;
+    bool headBytes = true;
+    uint64_t headSize = 65536;
+    bool fullHash = true;
+    bool exactCompare = true;
+    int threads = 4;
+};
+
+std::vector<std::string> splitGlobList(const std::string& text) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : text) {
+        if (c == '\n' || c == ',') {
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+        } else if (c != ' ' || !cur.empty()) {
+            cur += c;
+        }
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+// The v1 cascade, spelled out in the order it always ran. An exclude glob list
+// becomes exclude-mode glob rows, which is exactly what it meant.
+Pipeline pipelineFromLegacy(const LegacyV1& v1) {
+    Pipeline p;
+    p.combine = PatternCombine::Any;
+    p.select = PatternSelect::Exclude;
+    p.threads = v1.threads;
+
+    p.rules.push_back(Rule {true, RuleKind::MinSize, {}, v1.minSize});
+    for (const auto& g : splitGlobList(v1.excludeGlobs)) {
+        p.rules.push_back(Rule {true, RuleKind::Glob, g, 0});
+    }
+    if (v1.sameName) p.rules.push_back(Rule {true, RuleKind::SameName, {}, 0});
+    if (v1.sameMtime) p.rules.push_back(Rule {true, RuleKind::SameMtime, {}, 0});
+    p.rules.push_back(Rule {v1.headBytes, RuleKind::HeadBytes, {}, v1.headSize});
+    p.rules.push_back(Rule {v1.fullHash, RuleKind::FullHash, {}, 0});
+    p.rules.push_back(Rule {v1.exactCompare, RuleKind::ExactBytes, {}, 0});
+    return p;
+}
+
 }  // namespace
 
 std::string sessionPath() { return stateDir() + "/session.tsv"; }
 
 std::string serializeSession(const SessionData& d) {
     std::ostringstream os;
-    os << "v1\n";
+    os << "v2\n";
 
     for (const auto& r : d.roots) os << "root\t" << escapeField(r) << '\n';
 
-    os << "scope\t" << d.scope.minSize << '\t' << b(d.scope.includeHidden) << '\t'
-       << b(d.scope.collapseHardlinks) << '\t' << escapeField(d.scope.excludeGlobs) << '\n';
+    os << "scope\t" << b(d.scope.includeHidden) << '\t' << b(d.scope.collapseHardlinks) << '\n';
 
-    os << "stage\t" << b(d.stages.sameName) << '\t' << b(d.stages.sameMtime) << '\t'
-       << b(d.stages.headBytes) << '\t' << d.stages.headSize << '\t' << b(d.stages.fullHash)
-       << '\t' << b(d.stages.exactCompare) << '\t' << d.stages.hashThreads << '\n';
+    os << "pipe\t" << static_cast<int>(d.pipeline.combine) << '\t'
+       << static_cast<int>(d.pipeline.select) << '\t' << d.pipeline.threads << '\n';
+    // The count is written even when it is zero, because an empty rule list is a
+    // real choice and no rule lines at all would be indistinguishable from a
+    // file that predates them.
+    os << "rules\t" << d.pipeline.rules.size() << '\n';
+    // One line per rule, in list order, because list order is the pipeline.
+    for (const auto& r : d.pipeline.rules) {
+        os << "rule\t" << b(r.enabled) << '\t' << static_cast<int>(r.kind) << '\t' << r.number
+           << '\t' << escapeField(r.pattern) << '\n';
+    }
 
     os << "tie\t" << static_cast<int>(d.tie) << '\n';
     os << "quar\t" << escapeField(d.quarantineRoot) << '\n';
@@ -65,7 +122,13 @@ SessionData parseSession(const std::string& text) {
     SessionData d;
     std::istringstream is(text);
     std::string line;
-    if (!std::getline(is, line) || line != "v1") return d;
+    if (!std::getline(is, line)) return d;
+
+    const bool v1 = (line == "v1");
+    if (!v1 && line != "v2") return d;
+
+    LegacyV1 legacy;
+    bool sawRule = false;
 
     while (std::getline(is, line)) {
         if (line.empty()) continue;
@@ -74,20 +137,45 @@ SessionData parseSession(const std::string& text) {
 
         if (kind == "root" && f.size() >= 2) {
             d.roots.push_back(unescapeField(f[1]));
-        } else if (kind == "scope" && f.size() >= 5) {
-            d.scope.minSize = std::strtoull(f[1].c_str(), nullptr, 10);
+        } else if (kind == "scope" && v1 && f.size() >= 5) {
+            legacy.seen = true;
+            legacy.minSize = std::strtoull(f[1].c_str(), nullptr, 10);
             d.scope.includeHidden = toBool(f[2]);
             d.scope.collapseHardlinks = toBool(f[3]);
-            d.scope.excludeGlobs = unescapeField(f[4]);
-        } else if (kind == "stage" && f.size() >= 8) {
-            d.stages.sameName = toBool(f[1]);
-            d.stages.sameMtime = toBool(f[2]);
-            d.stages.headBytes = toBool(f[3]);
-            d.stages.headSize = std::strtoull(f[4].c_str(), nullptr, 10);
-            if (d.stages.headSize < 512) d.stages.headSize = 512;
-            d.stages.fullHash = toBool(f[5]);
-            d.stages.exactCompare = toBool(f[6]);
-            d.stages.hashThreads = clampInt(f[7], 1, 16, 4);
+            legacy.excludeGlobs = unescapeField(f[4]);
+        } else if (kind == "scope" && !v1 && f.size() >= 3) {
+            d.scope.includeHidden = toBool(f[1]);
+            d.scope.collapseHardlinks = toBool(f[2]);
+        } else if (kind == "stage" && v1 && f.size() >= 8) {
+            legacy.seen = true;
+            legacy.sameName = toBool(f[1]);
+            legacy.sameMtime = toBool(f[2]);
+            legacy.headBytes = toBool(f[3]);
+            legacy.headSize = std::strtoull(f[4].c_str(), nullptr, 10);
+            if (legacy.headSize < 512) legacy.headSize = 512;
+            legacy.fullHash = toBool(f[5]);
+            legacy.exactCompare = toBool(f[6]);
+            legacy.threads = clampInt(f[7], 1, 16, 4);
+        } else if (kind == "pipe" && f.size() >= 4) {
+            d.pipeline.combine = static_cast<PatternCombine>(clampInt(f[1], 0, 1, 0));
+            d.pipeline.select = static_cast<PatternSelect>(clampInt(f[2], 0, 1, 0));
+            d.pipeline.threads = clampInt(f[3], 1, 16, 4);
+        } else if (kind == "rules") {
+            // The list that follows replaces the default one rather than adding
+            // to it, so a saved pipeline is what comes back, not a merge.
+            d.pipeline.rules.clear();
+            sawRule = true;
+        } else if (kind == "rule" && f.size() >= 5) {
+            if (!sawRule) {
+                d.pipeline.rules.clear();
+                sawRule = true;
+            }
+            Rule r;
+            r.enabled = toBool(f[1]);
+            r.kind = static_cast<RuleKind>(clampInt(f[2], 0, kRuleKindCount - 1, 0));
+            r.number = std::strtoull(f[3].c_str(), nullptr, 10);
+            r.pattern = unescapeField(f[4]);
+            d.pipeline.rules.push_back(std::move(r));
         } else if (kind == "tie" && f.size() >= 2) {
             d.tie = static_cast<TieBreak>(clampInt(f[1], 0, 4, 0));
         } else if (kind == "quar" && f.size() >= 2) {
@@ -102,6 +190,8 @@ SessionData parseSession(const std::string& text) {
             d.filter.text = unescapeField(f[5]);
         }
     }
+
+    if (v1 && legacy.seen) d.pipeline = pipelineFromLegacy(legacy);
     return d;
 }
 

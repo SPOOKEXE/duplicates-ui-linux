@@ -1,7 +1,6 @@
 #include "scanner.h"
 
 #include <dirent.h>
-#include <fnmatch.h>
 #include <sys/stat.h>
 
 #include <algorithm>
@@ -10,6 +9,7 @@
 #include <unordered_map>
 
 #include "groups.h"
+#include "pipeline.h"
 #include "util.h"
 
 namespace {
@@ -17,11 +17,6 @@ namespace {
 std::string joinPath(const std::string& dir, const std::string& name) {
     if (dir == "/") return "/" + name;
     return dir + "/" + name;
-}
-
-std::string basename(const std::string& path) {
-    const size_t slash = path.find_last_of('/');
-    return slash == std::string::npos ? path : path.substr(slash + 1);
 }
 
 }  // namespace
@@ -48,36 +43,9 @@ std::vector<std::string> normalizeRoots(const std::vector<std::string>& roots) {
     return out;
 }
 
-std::vector<std::string> parseGlobList(const std::string& text) {
-    std::vector<std::string> out;
-    std::string cur;
-    for (char c : text) {
-        if (c == '\n' || c == ',') {
-            const std::string g = normalizePath(cur);
-            if (!g.empty()) out.push_back(g);
-            cur.clear();
-        } else {
-            cur += c;
-        }
-    }
-    const std::string g = normalizePath(cur);
-    if (!g.empty()) out.push_back(g);
-    return out;
-}
-
-bool matchesAnyGlob(const std::string& path, const std::vector<std::string>& globs) {
-    if (globs.empty()) return false;
-    const std::string name = basename(path);
-    for (const auto& g : globs) {
-        if (::fnmatch(g.c_str(), path.c_str(), 0) == 0) return true;
-        if (::fnmatch(g.c_str(), name.c_str(), 0) == 0) return true;
-    }
-    return false;
-}
-
 std::vector<FileEntry> walkRoots(const std::vector<std::string>& roots, const ScopeFilters& scope,
-                                 const WalkHooks& hooks, WalkStats& stats) {
-    const std::vector<std::string> globs = parseGlobList(scope.excludeGlobs);
+                                 const CompiledPipeline& pipe, const WalkHooks& hooks,
+                                 WalkStats& stats) {
     std::vector<FileEntry> files;
 
     for (size_t r = 0; r < roots.size(); ++r) {
@@ -120,8 +88,12 @@ std::vector<FileEntry> walkRoots(const std::vector<std::string>& roots, const Sc
                     continue;
                 }
                 if (S_ISDIR(st.st_mode)) {
-                    if (matchesAnyGlob(path, globs)) {
-                        ++stats.skippedExcluded;
+                    // An excluded directory is skipped whole rather than
+                    // walked and filtered file by file, which is most of the
+                    // reason to write an exclude rule in the first place.
+                    if (dirPruned(path, pipe)) {
+                        ++stats.prunedDirs;
+                        if (hooks.onNote) hooks.onNote("pruned directory: " + path);
                         continue;
                     }
                     stack.push_back(path);
@@ -129,13 +101,17 @@ std::vector<FileEntry> walkRoots(const std::vector<std::string>& roots, const Sc
                 }
                 if (!S_ISREG(st.st_mode)) continue;  // fifos, sockets, devices
 
-                if (matchesAnyGlob(path, globs)) {
-                    ++stats.skippedExcluded;
+                const uint64_t size = static_cast<uint64_t>(st.st_size);
+                if (size < pipe.minSize) {
+                    ++stats.skippedSmall;
                     continue;
                 }
-                const uint64_t size = static_cast<uint64_t>(st.st_size);
-                if (size < scope.minSize) {
-                    ++stats.skippedSmall;
+                if (pipe.maxSize > 0 && size > pipe.maxSize) {
+                    ++stats.skippedLarge;
+                    continue;
+                }
+                if (!patternsAllow(path, pipe)) {
+                    ++stats.skippedFiltered;
                     continue;
                 }
 
@@ -163,7 +139,8 @@ std::vector<FileEntry> walkRoots(const std::vector<std::string>& roots, const Sc
     return files;
 }
 
-void collapseHardlinks(std::vector<FileEntry>& files, TieBreak tie, WalkStats& stats) {
+void collapseHardlinks(std::vector<FileEntry>& files, TieBreak tie, WalkStats& stats,
+                       const WalkHooks* hooks) {
     // Only files with more than one link can possibly share an inode, and on a
     // normal tree that is a small minority, so the map stays small.
     struct Ident {
@@ -193,6 +170,9 @@ void collapseHardlinks(std::vector<FileEntry>& files, TieBreak tie, WalkStats& s
         size_t keep = it->second, fold = i;
         if (betterKeeper(files[fold], files[keep], tie)) std::swap(keep, fold);
 
+        if (hooks && hooks->onNote) {
+            hooks->onNote("folded hardlink: " + files[fold].path + " -> " + files[keep].path);
+        }
         files[keep].alsoLinkedAt.push_back(files[fold].path);
         for (auto& extra : files[fold].alsoLinkedAt) {
             files[keep].alsoLinkedAt.push_back(std::move(extra));

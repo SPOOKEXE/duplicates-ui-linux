@@ -10,6 +10,8 @@
 #include "dupes.h"
 #include "groups.h"
 #include "hash_cache.h"
+#include "log.h"
+#include "pipeline.h"
 #include "scan_engine.h"
 #include "session.h"
 
@@ -28,8 +30,13 @@ struct AppState {
     // Inputs. Order is priority: the first directory wins.
     std::vector<std::string> roots;
     ScopeFilters scope;
-    StageSettings stages;
+    // The ordered rule list that decides the whole scan.
+    Pipeline pipeline = defaultPipeline();
     TieBreak tie = TieBreak::OldestMtime;
+
+    // Declared before the engine and the queue so it outlives both: each of
+    // them borrows a pointer to it and writes from its own thread.
+    Log log;
 
     HashCache cache;
     ScanEngine engine;
@@ -70,12 +77,15 @@ struct AppState {
     DirBrowser browser;
     BrowserTarget browserTarget = BrowserTarget::None;
     char rootBuf[1024] = {};
-    char globBuf[512] = {};
     char filterBuf[256] = {};
     char quarBuf[1024] = {};
     bool askApplyConfirm = false;
     int askRestoreIndex = -1;
     bool showLog = true;
+    int newRuleKind = 0;  // what the pipeline's "add" combo is pointing at
+    bool logShowInfo = true;
+    bool logShowWarn = true;
+    bool logShowError = true;
     std::vector<std::string> droppedPaths;
     std::string notice;  // one-line message under the top bar, dismissed by the user
 };
@@ -99,7 +109,8 @@ void drawUi(AppState& s);
 // Split across ui_inputs.cpp, ui_results.cpp and ui_runs.cpp so no single file
 // carries the whole interface.
 void drawInputs(AppState& s);
-void drawScopeAndStages(AppState& s);
+// The scope toggles and the ordered rule list.
+void drawPipeline(AppState& s);
 // reserveBottom is the room to leave for the action bar underneath.
 void drawResults(AppState& s, float reserveBottom);
 void drawActionBar(AppState& s);

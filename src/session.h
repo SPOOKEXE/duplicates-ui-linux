@@ -5,6 +5,7 @@
 
 #include "dupes.h"
 #include "groups.h"
+#include "pipeline.h"
 #include "runs.h"
 
 // Everything worth surviving a restart. Scan results are deliberately absent:
@@ -13,7 +14,7 @@
 struct SessionData {
     std::vector<std::string> roots;
     ScopeFilters scope;
-    StageSettings stages;
+    Pipeline pipeline = defaultPipeline();
     TieBreak tie = TieBreak::OldestMtime;
     std::string quarantineRoot;
     ActionKind action = ActionKind::Quarantine;
@@ -26,8 +27,11 @@ struct SessionData {
 std::string sessionPath();
 
 // Tab separated, one record per line, with backslash, tab and newline escaped.
-// Deliberately not JSON: paths are the only tricky field, and escaping three
-// characters is less code than pulling in a parser.
+// Deliberately not JSON: paths and patterns are the only tricky fields, and
+// escaping three characters is less code than pulling in a parser.
+//
+// v1 files are still read: their fixed cascade and exclude globs are turned
+// into the equivalent pipeline, so upgrading does not silently lose settings.
 std::string serializeSession(const SessionData& d);
 SessionData parseSession(const std::string& text);
 

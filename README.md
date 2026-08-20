@@ -10,9 +10,11 @@ copies you do not want to keep.
 
 - **Inputs**: any number of directories, in a priority order you drag. The copy
   in the highest directory is the one that stays.
-- **Matching**: a cascade of stages, each only looking at what the one before it
-  kept. Size, then the first N bytes, then a full content hash, then a byte for
-  byte comparison. Every stage is a checkbox.
+- **Matching**: one ordered rule list you build yourself. Glob and regex filters
+  in include or exclude mode, size bounds, filename and mtime keys, first N
+  bytes, a full content hash, a byte for byte comparison. Every row ticks on and
+  off and moves up and down, so cheap filters run first and the expensive proof
+  only ever sees what survived.
 - **Keepers**: one copy per group is protected and can never be selected. The
   priority order decides which, a tie-break rule settles copies that rank
   equally, and clicking any row's keep dot overrides both for that group.
@@ -22,6 +24,9 @@ copies you do not want to keep.
   file is re-checked against what the scan saw immediately before it is removed.
 - **Speed**: hashing runs across threads and results are cached between runs, so
   rescanning an unchanged tree costs almost nothing.
+- **A log that says what happened**: the pipeline as it ran, what the walk found
+  and skipped, what each row took in and handed on, every hardlink folded, and
+  every file moved or deleted with the path it came from.
 
 Scanning `/usr` here, 514,750 files, is 2.7 seconds cold and 2.2 warm, and finds
 47,466 groups holding 1.6 GB of duplicated data.
@@ -71,31 +76,85 @@ artifacts to a release.
 
 ## How matching works
 
+One ordered list decides the whole scan. You add rows to it, tick them on and
+off, and move them up and down; the row above always runs first.
+
 ```
-walk      apply the scope filters, then fold paths that share an inode
-stage 1   bucket by size            free, it comes out of the walk
-stage 2   bucket by first N bytes   one seek per file
-stage 3   bucket by content hash    streamed, and skipped on a cache hit
-stage 4   compare the bytes         proof, rather than very strong suspicion
+PIPELINE                                        threads [====4====]
+      size                                         split   always
+[x] ^v x  glob    *.7z                             drop
+[x] ^v x  glob    *.zip                            drop
+[x] ^v x  glob    *.rar                            drop
+[x] ^v x  first bytes   65536 bytes                split
+[x] ^v x  full content hash                        split
+[x] ^v x  exact byte compare                       split
+
+  [ glob pattern v ]  Add   Reset      patterns [OR v] [INCLUDE v]
 ```
 
-After every stage, any bucket left holding one file is dropped, so each stage
-reads strictly less than the one before it. On a normal tree stage 2 is where
+Two kinds of row live in it:
+
+- **drop** rows look at one file and keep or discard it: glob pattern, regex
+  pattern, smallest size, largest size.
+- **split** rows need two files to mean anything, and cut the surviving
+  candidates into smaller sets: same filename, same mtime, first bytes, full
+  content hash, exact byte compare.
+
+They share a list because they commute: throwing a file away never changes
+whether two *other* files are copies. That is also why drop rows are applied
+during the walk wherever you put them, which costs nothing and lets an excluded
+folder be skipped whole.
+
+**Size is not a row.** It always runs first and cannot be moved or removed. It
+comes free from the walk's `lstat`, and it is what keeps every row below it
+affordable: an exact byte compare with nothing before it would read every file
+against every other one.
+
+After every row, any bucket left holding one file is dropped, so each row reads
+strictly less than the one before it. On a normal tree **first bytes** is where
 almost everything dies: same-size collisions are common, but same size **and**
 same first 64 KiB is nearly always a real duplicate.
 
-Two details worth knowing:
+Three details worth knowing:
 
-- **A file no larger than the head window is hashed in full by stage 2**, so it
-  skips stage 3 entirely. On a tree of documents and photos that is most files.
-- **Stage 4 is the only stage that proves anything.** Turning it off means
-  trusting a 64-bit hash with an irreversible delete. It is on by default, and
-  it is also why a rescan still reads the candidate files: a cached hash can
-  skip stage 3, but nothing can skip a byte comparison.
+- **A file no larger than the head window is hashed in full by the first-bytes
+  row**, so it skips the full content hash entirely. On a tree of documents and
+  photos that is most files.
+- **Exact byte compare is the only row that proves anything.** Turning it off
+  means trusting a 64-bit hash with an irreversible delete. It is on by default,
+  and it is also why a rescan still reads the candidate files: a cached hash can
+  skip the content hash, but nothing can skip a byte comparison.
+- **Same filename and same mtime can only ever narrow a result.** They split
+  buckets further, so they can hide a real duplicate but never invent one.
 
-Two optional extra keys, **same filename** and **same mtime**, only ever split
-buckets further. They can narrow a huge result set but can never introduce a
-false match.
+A second row of the same kind has nothing left to do, so it is dropped and said
+so in the log. Rows you untick never reach the scan at all.
+
+### Pattern rows
+
+Glob and regex rows are the same row wearing a different hat: click the kind
+button to switch one to the other. Globs go through `fnmatch`, regexes through
+ECMAScript `std::regex`, and both are tried against the whole path **and**
+against the filename, so `*.zip` and `/mnt/scratch/*` both do what they look
+like they do. A regex that will not build is marked in red as you type it and
+skipped at scan time rather than throwing halfway through.
+
+The two boxes under the list describe the pattern rows as a set, which is not a
+per-row question:
+
+- **OR** keeps a file if any pattern matches. **AND** only if every one does.
+- **INCLUDE** scans only what matches. **EXCLUDE** skips what matches, and skips
+  a matching folder whole without walking into it.
+
+With no pattern rows at all, both modes keep everything: "include nothing" is
+never what an empty list means. Include mode cannot prune directories, because a
+folder name says nothing about whether the files inside it will match.
+
+So the answer to "only look at my archives" is three glob rows, `OR`, `INCLUDE`:
+
+```
+[x] glob  *.7z      [x] glob  *.zip      [x] glob  *.rar
+```
 
 ### Hardlinks
 
@@ -107,14 +166,16 @@ treat every linked path as an ordinary, actionable copy.
 
 ### What never reaches a group
 
-- Files below the size floor, which is 1 byte by default, so empty files do not
-  form one enormous useless group. Set it to 0 if you want them.
+- Files below the size floor, which is a `smallest size` row set to 1 byte by
+  default, so empty files do not form one enormous useless group. Set it to 0,
+  or delete the row, if you want them.
 - Symlinks. They are never followed, so a link is never mistaken for its target
   and a symlink loop cannot hang the walk.
 - Hidden files and dot directories, unless you ask for them. Without this a
   `.git` object store contributes thousands of dull duplicates.
-- Anything matching an exclude glob, matched against both the full path and the
-  filename.
+- Anything a pattern row turns away, and everything inside a folder an exclude
+  pattern matched.
+- Anything outside the size floor or ceiling, if you added those rows.
 - Anything unreadable. It is logged and dropped, so it can never be deleted.
 
 Input directories that overlap are folded together before the walk, so no file
@@ -165,12 +226,46 @@ The **Runs** tab lists past runs newest first. Restore moves every file in a
 quarantine run back to its original path, creating directories as needed and
 skipping any path that has since been reoccupied rather than overwriting it.
 
+## The log
+
+The **Log** tab is the running commentary of the session, not just its errors.
+Each line is stamped and levelled, and the three tick boxes filter by level:
+
+```
+01:30:39 scan started: 1 input directory
+01:30:39   1. /mnt/photos
+01:30:39 pipeline: size, at least 1 B, *.zip or *.rar (include), first 65536 bytes, exact byte compare
+01:30:39 scope: hidden files skipped, hardlinks folded, keeping the oldest mtime on a tie, 4 hash thread(s)
+01:30:39 walk finished: 7 file(s), 976.6 KB, in 0 ms
+01:30:39 skipped: 0 hidden, 0 below the floor, 0 above the ceiling, 0 symlink(s), 2 filtered out, ...
+01:30:39 folded hardlink: /mnt/photos/a/movie.zip -> /mnt/photos/b/movie.zip
+01:30:39 size: 6 in -> 6 candidates
+01:30:39 first 64.0 KB: 6 in -> 6 candidates
+01:30:39 exact byte compare: 6 in -> 6 candidates
+01:30:39 scan finished: 3 group(s), 3 extra(s), 390.6 KB reclaimable, read 1.1 MB in 2 ms, 0 error(s)
+01:30:43 quarantine run started: 3 file(s), 390.6 KB -> /mnt/quarantine
+01:30:43 moved: /mnt/photos/b/movie.zip -> /mnt/quarantine/mnt/photos/b/movie.zip  (195.3 KB, keeping /mnt/photos/a/movie.zip)
+01:30:43 quarantine run finished: 3 done, 0 failed, 390.6 KB reclaimed
+```
+
+Every file that is moved, deleted or restored is named with the path it came
+from, and a rule that could not be built is reported rather than quietly
+dropped. The buffer is a rolling window; when lines scroll off the top the tab
+says how many, because a truncated log that looks complete is worse than none.
+The permanent record is the run manifest.
+
+**Double click** any input directory, or any path in a duplicate group, to open
+it in your file manager (`xdg-open`). Single click on an input row is reserved
+for dragging it, which is how priority is reordered.
+
 ## State on disk
 
 - `$XDG_STATE_HOME/duplicates-ui/session.tsv` holds the inputs and their order,
-  the stage and scope settings, the tie-break, the quarantine folder and the
-  view. Written only when it changes, and through a temporary file so a crash
-  cannot truncate it.
+  the rule list in its exact order, the pattern modes, the scope toggles, the
+  tie-break, the quarantine folder and the view. Written only when it changes,
+  and through a temporary file so a crash cannot truncate it. A `v1` file from
+  before the rule list is still read: its fixed cascade and exclude globs are
+  turned into the equivalent rows, so upgrading loses nothing.
 - `$XDG_CACHE_HOME/duplicates-ui/hashes.tsv` maps `(device, inode, size, mtime)`
   to a content hash. A file that has been touched simply misses and is
   recomputed, so there is no invalidation logic to get wrong. Deleting it costs

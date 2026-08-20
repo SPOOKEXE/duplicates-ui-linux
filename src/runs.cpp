@@ -11,6 +11,7 @@
 #include <fstream>
 #include <sstream>
 
+#include "log.h"
 #include "util.h"
 
 namespace fs = std::filesystem;
@@ -159,8 +160,13 @@ std::vector<RunEntry> loadRuns(const std::string& quarantineRoot) {
     return out;
 }
 
-RestoreResult restoreRun(const RunEntry& run) {
+RestoreResult restoreRun(const RunEntry& run, Log* log) {
     RestoreResult r;
+    const auto note = [&](LogLevel level, const std::string& m) {
+        if (log) log->add(level, m);
+    };
+    note(LogLevel::Warn, "restore started from " + run.manifest);
+
     if (run.kind == ActionKind::Delete) {
         r.notes.push_back("a delete run cannot be restored");
         return r;
@@ -185,6 +191,7 @@ RestoreResult restoreRun(const RunEntry& run) {
         if (!exists(dest)) {
             ++r.skipped;
             r.notes.push_back("gone from quarantine: " + dest);
+            note(LogLevel::Warn, "skipped, gone from quarantine: " + dest);
             continue;
         }
         if (exists(original)) {
@@ -192,20 +199,24 @@ RestoreResult restoreRun(const RunEntry& run) {
             // data loss this whole feature exists to avoid.
             ++r.skipped;
             r.notes.push_back("path is occupied again: " + original);
+            note(LogLevel::Warn, "skipped, the path is occupied again: " + original);
             continue;
         }
         if (!ensureDir(fs::path(original).parent_path().string())) {
             ++r.failed;
             r.notes.push_back("cannot recreate directory for " + original);
+            note(LogLevel::Error, "cannot recreate the directory for " + original);
             continue;
         }
 
         std::string err;
         if (moveFile(dest, original, err)) {
             ++r.restored;
+            note(LogLevel::Info, "restored: " + dest + " -> " + original);
         } else {
             ++r.failed;
             r.notes.push_back(original + ": " + err);
+            note(LogLevel::Error, "restore failed: " + original + " (" + err + ")");
         }
     }
 
@@ -217,5 +228,9 @@ RestoreResult restoreRun(const RunEntry& run) {
             std::fclose(f);
         }
     }
+
+    note(LogLevel::Warn, "restore finished: " + formatCount(r.restored) + " restored, " +
+                             formatCount(r.skipped) + " skipped, " + formatCount(r.failed) +
+                             " failed");
     return r;
 }

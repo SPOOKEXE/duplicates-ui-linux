@@ -21,6 +21,8 @@
 #include "groups.h"
 #include "hash.h"
 #include "hash_cache.h"
+#include "log.h"
+#include "pipeline.h"
 #include "runs.h"
 #include "scanner.h"
 #include "session.h"
@@ -151,18 +153,69 @@ struct ScanOutcome {
     WalkStats walk;
 };
 
-ScanOutcome scanFixture(const std::string& base, StageSettings stages, ScopeFilters scope,
-                        TieBreak tie = TieBreak::OldestMtime) {
+// The knobs the fixed cascade used to expose, so a test can tweak one row
+// without spelling out the whole rule list.
+struct StageOptions {
+    bool sameName = false;
+    bool sameMtime = false;
+    bool headBytes = true;
+    uint64_t headSize = 65536;
+    bool fullHash = true;
+    bool exactCompare = true;
+    uint64_t minSize = 1;
+    std::string patterns;  // comma separated
+    bool regex = false;
+    PatternCombine combine = PatternCombine::Any;
+    PatternSelect select = PatternSelect::Exclude;
+};
+
+Pipeline pipelineFor(const StageOptions& o) {
+    Pipeline p;
+    p.threads = 2;
+    p.combine = o.combine;
+    p.select = o.select;
+    p.rules.push_back(Rule {true, RuleKind::MinSize, {}, o.minSize});
+
+    std::string cur;
+    const auto flush = [&] {
+        if (cur.empty()) return;
+        p.rules.push_back(Rule {true, o.regex ? RuleKind::Regex : RuleKind::Glob, cur, 0});
+        cur.clear();
+    };
+    for (char c : o.patterns) {
+        if (c == ',') {
+            flush();
+        } else {
+            cur += c;
+        }
+    }
+    flush();
+
+    if (o.sameName) p.rules.push_back(Rule {true, RuleKind::SameName, {}, 0});
+    if (o.sameMtime) p.rules.push_back(Rule {true, RuleKind::SameMtime, {}, 0});
+    if (o.headBytes) p.rules.push_back(Rule {true, RuleKind::HeadBytes, {}, o.headSize});
+    if (o.fullHash) p.rules.push_back(Rule {true, RuleKind::FullHash, {}, 0});
+    if (o.exactCompare) p.rules.push_back(Rule {true, RuleKind::ExactBytes, {}, 0});
+    return p;
+}
+
+ScanOutcome scanPipeline(const std::string& base, const Pipeline& pipeline, ScopeFilters scope,
+                         TieBreak tie = TieBreak::OldestMtime) {
     ScanOutcome out;
+    const CompiledPipeline compiled = compilePipeline(pipeline);
     WalkHooks hooks;
-    out.files = walkRoots({base + "/a", base + "/b"}, scope, hooks, out.walk);
+    out.files = walkRoots({base + "/a", base + "/b"}, scope, compiled, hooks, out.walk);
     if (scope.collapseHardlinks) collapseHardlinks(out.files, tie, out.walk);
 
     CascadeHooks ch;
-    ch.threads = 2;
-    out.groups = runCascade(out.files, stages, ch);
+    out.groups = runCascade(out.files, compiled, ch);
     resolveKeepers(out.groups, out.files, tie);
     return out;
+}
+
+ScanOutcome scanFixture(const std::string& base, StageOptions stages, ScopeFilters scope,
+                        TieBreak tie = TieBreak::OldestMtime) {
+    return scanPipeline(base, pipelineFor(stages), scope, tie);
 }
 
 // Finds the group whose keeper path ends with `suffix`, or -1.
@@ -184,7 +237,7 @@ void testCascade() {
     TempDir dir;
     buildFixture(dir.path);
 
-    StageSettings stages;
+    StageOptions stages;
     stages.headSize = 64;  // small enough that the fixture can exercise both sides of it
     ScopeFilters scope;
 
@@ -233,7 +286,7 @@ void testHeadIsFullShortcut() {
     writeFile(dir.path + "/a/x", "abc");
     writeFile(dir.path + "/b/x", "abc");
 
-    StageSettings stages;
+    StageOptions stages;
     stages.headSize = 64;  // both files are far smaller
     ScopeFilters scope;
     const ScanOutcome o = scanFixture(dir.path, stages, scope);
@@ -256,7 +309,7 @@ void testExactCompareSplitsBucket() {
     writeFile(dir.path + "/a/x", repeat('p', 500));
     writeFile(dir.path + "/b/x", repeat('r', 500));
 
-    StageSettings stages;
+    StageOptions stages;
     stages.headBytes = false;
     stages.fullHash = false;
     stages.exactCompare = true;
@@ -267,7 +320,7 @@ void testExactCompareSplitsBucket() {
 
     // Without it, size alone would have called them duplicates, which is exactly
     // why the warning exists in the interface.
-    StageSettings unsafe = stages;
+    StageOptions unsafe = stages;
     unsafe.exactCompare = false;
     const ScanOutcome bad = scanFixture(dir.path, unsafe, scope);
     CHECK_EQ(bad.groups.size(), 1);
@@ -280,7 +333,7 @@ void testHardlinkCollapseOff() {
     fs::create_directories(dir.path + "/b");
     fs::create_hard_link(dir.path + "/a/x", dir.path + "/b/x");
 
-    StageSettings stages;
+    StageOptions stages;
     ScopeFilters scope;
     scope.collapseHardlinks = false;
 
@@ -304,15 +357,15 @@ void testExcludeGlobsAndHidden() {
     writeFile(dir.path + "/a/skip.tmp", repeat('t', 300));
     writeFile(dir.path + "/b/skip.tmp", repeat('t', 300));
 
-    StageSettings stages;
+    StageOptions stages;
+    stages.patterns = "*.tmp";
     ScopeFilters scope;
-    scope.excludeGlobs = "*.tmp";
     const ScanOutcome o = scanFixture(dir.path, stages, scope);
     CHECK_EQ(o.groups.size(), 1);
-    CHECK_EQ(o.walk.skippedExcluded, 2);
+    CHECK_EQ(o.walk.skippedFiltered, 2);
     CHECK_EQ(o.walk.skippedHidden, 1);
 
-    scope.excludeGlobs.clear();
+    stages.patterns.clear();
     scope.includeHidden = true;
     const ScanOutcome withHidden = scanFixture(dir.path, stages, scope);
     // keep.bin x2 plus the hidden copy is one group of three, and the two .tmp
@@ -321,6 +374,216 @@ void testExcludeGlobsAndHidden() {
     const int g = findGroup(withHidden, "/a/keep.bin");
     CHECK(g >= 0);
     if (g >= 0) CHECK_EQ(withHidden.groups[g].members.size(), 3);
+}
+
+void testIncludeAndCombineModes() {
+    currentTest = "filter-modes";
+    TempDir dir;
+    writeFile(dir.path + "/a/keep.zip", repeat('z', 300));
+    writeFile(dir.path + "/b/keep.zip", repeat('z', 300));
+    writeFile(dir.path + "/a/other.txt", repeat('t', 300));
+    writeFile(dir.path + "/b/other.txt", repeat('t', 300));
+
+    ScopeFilters scope;
+
+    // Include mode keeps only what matches, which is the whole point of asking
+    // for one archive format and nothing else.
+    StageOptions inc;
+    inc.patterns = "*.zip";
+    inc.select = PatternSelect::Include;
+    const ScanOutcome only = scanFixture(dir.path, inc, scope);
+    CHECK_EQ(only.groups.size(), 1);
+    CHECK_EQ(only.walk.skippedFiltered, 2);
+    CHECK(findGroup(only, "/a/keep.zip") >= 0);
+
+    // Several include patterns are an OR by default: any of them is enough.
+    StageOptions two = inc;
+    two.patterns = "*.zip,*.txt";
+    CHECK_EQ(scanFixture(dir.path, two, scope).groups.size(), 2);
+
+    // The same two under AND can never both hold, so nothing survives.
+    StageOptions both = two;
+    both.combine = PatternCombine::All;
+    const ScanOutcome none = scanFixture(dir.path, both, scope);
+    CHECK_EQ(none.groups.size(), 0);
+    CHECK_EQ(none.files.size(), 0);
+
+    // An empty pattern list means "no filter", in include mode as much as in
+    // exclude mode. Reading it as "include nothing" would hide everything.
+    StageOptions empty;
+    empty.select = PatternSelect::Include;
+    CHECK_EQ(scanFixture(dir.path, empty, scope).groups.size(), 2);
+}
+
+void testRegexRules() {
+    currentTest = "regex-rules";
+    TempDir dir;
+    writeFile(dir.path + "/a/movie.mkv", repeat('m', 400));
+    writeFile(dir.path + "/b/movie.mkv", repeat('m', 400));
+    writeFile(dir.path + "/a/notes.txt", repeat('n', 400));
+    writeFile(dir.path + "/b/notes.txt", repeat('n', 400));
+
+    ScopeFilters scope;
+    StageOptions o;
+    o.regex = true;
+    o.patterns = "\\.(mkv|mp4)$";
+    o.select = PatternSelect::Include;
+
+    const ScanOutcome inc = scanFixture(dir.path, o, scope);
+    CHECK_EQ(inc.groups.size(), 1);
+    CHECK(findGroup(inc, "/a/movie.mkv") >= 0);
+
+    o.select = PatternSelect::Exclude;
+    const ScanOutcome exc = scanFixture(dir.path, o, scope);
+    CHECK_EQ(exc.groups.size(), 1);
+    CHECK(findGroup(exc, "/a/notes.txt") >= 0);
+
+    // A regex that will not build is reported and skipped, and the rest of the
+    // scan still runs. Losing a rule silently would be the worse failure.
+    Pipeline broken;
+    broken.rules.push_back(Rule {true, RuleKind::Regex, "([unclosed", 0});
+    broken.rules.push_back(Rule {true, RuleKind::ExactBytes, {}, 0});
+    const CompiledPipeline c = compilePipeline(broken);
+    CHECK(c.patterns.empty());
+    CHECK_EQ(c.problems.size(), 1);
+    CHECK_EQ(c.splits.size(), 1);
+
+    std::string err;
+    CHECK(!regexIsValid("([unclosed", err));
+    CHECK(regexIsValid("\\.zip$", err));
+}
+
+void testDirectoryPruning() {
+    currentTest = "dir-pruning";
+    TempDir dir;
+    writeFile(dir.path + "/a/keep.bin", repeat('k', 300));
+    writeFile(dir.path + "/b/keep.bin", repeat('k', 300));
+    writeFile(dir.path + "/a/cache/junk.bin", repeat('j', 300));
+    writeFile(dir.path + "/b/cache/junk.bin", repeat('j', 300));
+
+    ScopeFilters scope;
+    StageOptions excl;
+    excl.patterns = "*/cache";
+
+    const ScanOutcome pruned = scanFixture(dir.path, excl, scope);
+    CHECK_EQ(pruned.groups.size(), 1);
+    // The folders were skipped whole rather than walked and filtered per file.
+    CHECK_EQ(pruned.walk.prunedDirs, 2);
+    CHECK_EQ(pruned.walk.skippedFiltered, 0);
+
+    // Include mode cannot prune: a folder name says nothing about whether the
+    // files inside it will match, so every directory is still walked.
+    StageOptions inc;
+    inc.patterns = "*.bin";
+    inc.select = PatternSelect::Include;
+    const ScanOutcome walked = scanFixture(dir.path, inc, scope);
+    CHECK_EQ(walked.walk.prunedDirs, 0);
+    CHECK_EQ(walked.groups.size(), 2);
+}
+
+void testRuleOrderAndCompile() {
+    currentTest = "rule-order";
+    TempDir dir;
+    writeFile(dir.path + "/a/x.bin", repeat('q', 900));
+    writeFile(dir.path + "/b/x.bin", repeat('q', 900));
+    writeFile(dir.path + "/a/y.bin", repeat('w', 900));
+    writeFile(dir.path + "/b/z.bin", repeat('w', 900));
+
+    ScopeFilters scope;
+
+    // Same filename after the content rows rather than before them: it can only
+    // ever narrow a set, so the answer must not depend on where it sits.
+    Pipeline late;
+    late.threads = 2;
+    late.rules = {
+        Rule {true, RuleKind::MinSize, {}, 1},
+        Rule {true, RuleKind::HeadBytes, {}, 512},
+        Rule {true, RuleKind::ExactBytes, {}, 0},
+        Rule {true, RuleKind::SameName, {}, 0},
+    };
+    Pipeline early = late;
+    early.rules = {late.rules[0], late.rules[3], late.rules[1], late.rules[2]};
+
+    const ScanOutcome a = scanPipeline(dir.path, late, scope);
+    const ScanOutcome b = scanPipeline(dir.path, early, scope);
+    CHECK_EQ(a.groups.size(), 1);  // y.bin and z.bin match by content but not by name
+    CHECK_EQ(b.groups.size(), 1);
+
+    // A second row of a kind has nothing left to do, so it is dropped and said
+    // out loud rather than run twice.
+    Pipeline twice;
+    twice.rules = {
+        Rule {true, RuleKind::FullHash, {}, 0},
+        Rule {true, RuleKind::FullHash, {}, 0},
+    };
+    const CompiledPipeline c = compilePipeline(twice);
+    CHECK_EQ(c.splits.size(), 1);
+    CHECK_EQ(c.problems.size(), 1);
+
+    // Disabled rows never reach the compiled form at all.
+    Pipeline off;
+    off.rules = {Rule {false, RuleKind::Glob, "*.zip", 0}, Rule {false, RuleKind::ExactBytes, {}, 0}};
+    const CompiledPipeline oc = compilePipeline(off);
+    CHECK(oc.patterns.empty());
+    CHECK(oc.splits.empty());
+
+    // The head window has a floor: a smaller one would cost a seek per file and
+    // buy almost nothing.
+    Pipeline tiny;
+    tiny.rules = {Rule {true, RuleKind::HeadBytes, {}, 16}};
+    CHECK_EQ(compilePipeline(tiny).splits[0].number, 512);
+}
+
+void testSizeBounds() {
+    currentTest = "size-bounds";
+    TempDir dir;
+    writeFile(dir.path + "/a/small.bin", repeat('s', 100));
+    writeFile(dir.path + "/b/small.bin", repeat('s', 100));
+    writeFile(dir.path + "/a/big.bin", repeat('g', 5000));
+    writeFile(dir.path + "/b/big.bin", repeat('g', 5000));
+
+    ScopeFilters scope;
+
+    StageOptions floorOnly;
+    floorOnly.minSize = 1000;
+    const ScanOutcome big = scanFixture(dir.path, floorOnly, scope);
+    CHECK_EQ(big.groups.size(), 1);
+    CHECK_EQ(big.walk.skippedSmall, 2);
+    CHECK(findGroup(big, "/a/big.bin") >= 0);
+
+    // A ceiling is its own row, so it needs the pipeline spelled out.
+    Pipeline capped;
+    capped.threads = 2;
+    capped.rules = {
+        Rule {true, RuleKind::MinSize, {}, 1},
+        Rule {true, RuleKind::MaxSize, {}, 1000},
+        Rule {true, RuleKind::ExactBytes, {}, 0},
+    };
+    const ScanOutcome small = scanPipeline(dir.path, capped, scope);
+    CHECK_EQ(small.groups.size(), 1);
+    CHECK_EQ(small.walk.skippedLarge, 2);
+    CHECK(findGroup(small, "/a/small.bin") >= 0);
+}
+
+void testLogBuffer() {
+    currentTest = "log";
+    Log log;
+    log.info("walked");
+    log.warn("careful");
+    log.error("broken");
+
+    const std::vector<LogLine> lines = log.lines();
+    CHECK_EQ(lines.size(), 3);
+    CHECK_EQ(log.count(LogLevel::Info), 1);
+    CHECK_EQ(log.count(LogLevel::Error), 1);
+    CHECK(lines[0].text == "walked");
+    CHECK(lines[2].level == LogLevel::Error);
+    CHECK(!lines[0].stamp.empty());
+    CHECK_EQ(log.dropped(), 0);
+
+    log.clear();
+    CHECK(log.lines().empty());
+    CHECK_EQ(log.count(LogLevel::Warn), 0);
 }
 
 // ---------------------------------------------------------------- priority
@@ -453,9 +716,6 @@ void testNormalizeRoots() {
     const std::vector<std::string> reversed = normalizeRoots({"/mnt/other", "/mnt/data"});
     CHECK(reversed[0] == "/mnt/other");
 
-    CHECK(matchesAnyGlob("/x/y/file.tmp", {"*.tmp"}));
-    CHECK(matchesAnyGlob("/mnt/scratch/a", {"/mnt/scratch/*"}));
-    CHECK(!matchesAnyGlob("/x/y/file.txt", {"*.tmp"}));
     CHECK(pathIsUnder("/a", "/a/b"));
     CHECK(!pathIsUnder("/a", "/ab"));
 }
@@ -532,7 +792,7 @@ void testQuarantineAndRestore() {
     writeFile(extra, "payload");
 
     ActionQueue q;
-    q.start({itemFor(extra, keeper)}, ActionKind::Quarantine, quarantine);
+    q.start({itemFor(extra, keeper)}, ActionKind::Quarantine, quarantine, nullptr);
     waitFor(q);
 
     RunSummary summary;
@@ -572,7 +832,7 @@ void testDeleteRun() {
     writeFile(extra, "payload");
 
     ActionQueue q;
-    q.start({itemFor(extra, keeper)}, ActionKind::Delete, {});
+    q.start({itemFor(extra, keeper)}, ActionKind::Delete, {}, nullptr);
     waitFor(q);
 
     RunSummary summary;
@@ -599,7 +859,7 @@ void testVerifyBeforeActing() {
     item.mtime -= 100;  // pretend the scan saw an older version
 
     ActionQueue q;
-    q.start({item}, ActionKind::Delete, {});
+    q.start({item}, ActionKind::Delete, {}, nullptr);
     waitFor(q);
 
     RunSummary summary;
@@ -616,7 +876,7 @@ void testVerifyBeforeActing() {
     ActionItem keeperMoved = itemFor(extra, keeper);
     keeperMoved.keeperSize += 1;
     ActionQueue q2;
-    q2.start({keeperMoved}, ActionKind::Delete, {});
+    q2.start({keeperMoved}, ActionKind::Delete, {}, nullptr);
     waitFor(q2);
     RunSummary s2;
     CHECK(q2.takeSummary(s2));
@@ -635,14 +895,19 @@ void testSessionRoundTrip() {
     currentTest = "session";
     SessionData d;
     d.roots = {"/mnt/one", "/home/user/pictures with spaces"};
-    d.scope.minSize = 4096;
     d.scope.includeHidden = true;
     d.scope.collapseHardlinks = false;
-    d.scope.excludeGlobs = "*.tmp,*.part";
-    d.stages.sameName = true;
-    d.stages.headSize = 8192;
-    d.stages.exactCompare = false;
-    d.stages.hashThreads = 12;
+    d.pipeline.rules = {
+        Rule {true, RuleKind::MinSize, {}, 4096},
+        Rule {true, RuleKind::Glob, "*.7z", 0},
+        Rule {false, RuleKind::Regex, "\\.part[0-9]+$", 0},
+        Rule {true, RuleKind::SameName, {}, 0},
+        Rule {true, RuleKind::HeadBytes, {}, 8192},
+        Rule {true, RuleKind::FullHash, {}, 0},
+    };
+    d.pipeline.combine = PatternCombine::All;
+    d.pipeline.select = PatternSelect::Include;
+    d.pipeline.threads = 12;
     d.tie = TieBreak::ShortestPath;
     d.quarantineRoot = "/mnt/quarantine";
     d.action = ActionKind::Delete;
@@ -654,14 +919,19 @@ void testSessionRoundTrip() {
 
     const SessionData back = parseSession(serializeSession(d));
     CHECK(back.roots == d.roots);
-    CHECK_EQ(back.scope.minSize, 4096);
     CHECK(back.scope.includeHidden);
     CHECK(!back.scope.collapseHardlinks);
-    CHECK(back.scope.excludeGlobs == d.scope.excludeGlobs);
-    CHECK(back.stages.sameName);
-    CHECK_EQ(back.stages.headSize, 8192);
-    CHECK(!back.stages.exactCompare);
-    CHECK_EQ(static_cast<uint64_t>(back.stages.hashThreads), 12);
+    CHECK_EQ(back.pipeline.rules.size(), d.pipeline.rules.size());
+    // Order is the pipeline, so it has to survive the round trip exactly.
+    for (size_t i = 0; i < back.pipeline.rules.size() && i < d.pipeline.rules.size(); ++i) {
+        CHECK(back.pipeline.rules[i].kind == d.pipeline.rules[i].kind);
+        CHECK(back.pipeline.rules[i].enabled == d.pipeline.rules[i].enabled);
+        CHECK(back.pipeline.rules[i].pattern == d.pipeline.rules[i].pattern);
+        CHECK_EQ(back.pipeline.rules[i].number, d.pipeline.rules[i].number);
+    }
+    CHECK(back.pipeline.combine == PatternCombine::All);
+    CHECK(back.pipeline.select == PatternSelect::Include);
+    CHECK_EQ(static_cast<uint64_t>(back.pipeline.threads), 12);
     CHECK(back.tie == TieBreak::ShortestPath);
     CHECK(back.quarantineRoot == d.quarantineRoot);
     CHECK(back.action == ActionKind::Delete);
@@ -671,6 +941,12 @@ void testSessionRoundTrip() {
     CHECK_EQ(static_cast<uint64_t>(back.filter.minMembers), 3);
     CHECK(!back.showLog);
 
+    // An empty rule list is a real choice, not a reason to fall back to the
+    // default one.
+    SessionData bare;
+    bare.pipeline.rules.clear();
+    CHECK(parseSession(serializeSession(bare)).pipeline.rules.empty());
+
     // A path holding a tab or a newline has to survive a tab separated format.
     SessionData weird;
     weird.roots = {"/a\tb", "/c\nd", "/e\\f"};
@@ -679,6 +955,47 @@ void testSessionRoundTrip() {
     // Anything unrecognised gives defaults rather than nonsense.
     CHECK(parseSession("").roots.empty());
     CHECK(parseSession("v99\nroot\t/x\n").roots.empty());
+}
+
+void testSessionV1Migration() {
+    currentTest = "session-v1";
+    // Exactly what the previous version wrote: a size floor and exclude globs in
+    // the scope record, and the fixed cascade in the stage record.
+    const std::string v1 =
+        "v1\n"
+        "root\t/mnt/one\n"
+        "scope\t4096\t1\t0\t*.tmp,*.part\n"
+        "stage\t1\t0\t1\t8192\t1\t0\t12\n"
+        "tie\t2\n"
+        "quar\t/mnt/quarantine\n"
+        "act\t0\n"
+        "view\t2\t1024\t3\t0\tholiday\n";
+
+    const SessionData d = parseSession(v1);
+    CHECK(d.roots.size() == 1);
+    CHECK(d.scope.includeHidden);
+    CHECK(!d.scope.collapseHardlinks);
+    CHECK_EQ(static_cast<uint64_t>(d.pipeline.threads), 12);
+    CHECK(d.pipeline.select == PatternSelect::Exclude);
+
+    // The old fixed order, rebuilt: floor, the two globs, same filename, then
+    // the three content rows with exact compare switched off as it was.
+    CHECK_EQ(d.pipeline.rules.size(), 7);
+    if (d.pipeline.rules.size() == 7) {
+        CHECK(d.pipeline.rules[0].kind == RuleKind::MinSize);
+        CHECK_EQ(d.pipeline.rules[0].number, 4096);
+        CHECK(d.pipeline.rules[1].kind == RuleKind::Glob);
+        CHECK(d.pipeline.rules[1].pattern == "*.tmp");
+        CHECK(d.pipeline.rules[2].pattern == "*.part");
+        CHECK(d.pipeline.rules[3].kind == RuleKind::SameName);
+        CHECK(d.pipeline.rules[4].kind == RuleKind::HeadBytes);
+        CHECK_EQ(d.pipeline.rules[4].number, 8192);
+        CHECK(d.pipeline.rules[5].kind == RuleKind::FullHash);
+        CHECK(d.pipeline.rules[6].kind == RuleKind::ExactBytes);
+        CHECK(!d.pipeline.rules[6].enabled);
+    }
+    CHECK(d.tie == TieBreak::ShortestPath);
+    CHECK(d.action == ActionKind::Delete);
 }
 
 void testFormatting() {
@@ -712,6 +1029,12 @@ int main() {
     testExactCompareSplitsBucket();
     testHardlinkCollapseOff();
     testExcludeGlobsAndHidden();
+    testIncludeAndCombineModes();
+    testRegexRules();
+    testDirectoryPruning();
+    testRuleOrderAndCompile();
+    testSizeBounds();
+    testLogBuffer();
     testPriorityAndTieBreak();
     testSelectionOps();
     testPruneRemoved();
@@ -722,6 +1045,7 @@ int main() {
     testDeleteRun();
     testVerifyBeforeActing();
     testSessionRoundTrip();
+    testSessionV1Migration();
     testFormatting();
 
     std::printf("%d checks, %d failures\n", checks, failures);

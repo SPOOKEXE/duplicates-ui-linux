@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+class Log;
+
 // What was done to the files a run touched.
 enum class ActionKind { Delete, Quarantine };
 
@@ -60,5 +62,6 @@ struct RestoreResult {
 };
 
 // Puts every file in a quarantine run back where it came from. A path that has
-// since been reoccupied is reported and left alone, never overwritten.
-RestoreResult restoreRun(const RunEntry& run);
+// since been reoccupied is reported and left alone, never overwritten. Every
+// path that moves is written to the log, when one is given.
+RestoreResult restoreRun(const RunEntry& run, Log* log = nullptr);

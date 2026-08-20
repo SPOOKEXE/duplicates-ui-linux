@@ -117,9 +117,17 @@ void drawMemberRow(AppState& s, int groupIndex, int memberIndex) {
     ImGui::TextColored(isKeeper ? ImVec4(1, 1, 1, 1) : kDim, "%s",
                        elideMiddle(f.path, pathWidth).c_str());
     if (ImGui::IsItemHovered()) {
+        // The folder rather than the file: opening a duplicate in whatever
+        // application owns it is rarely what someone checking a copy wants.
+        if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            if (!openContainingFolder(f.path)) {
+                s.notice = "could not open the folder; is xdg-open installed?";
+            }
+        }
         ImGui::BeginTooltip();
         ImGui::TextUnformatted(f.path.c_str());
         for (const auto& link : f.alsoLinkedAt) ImGui::TextColored(kDim, "linked: %s", link.c_str());
+        ImGui::TextColored(kDim, "double click to open the containing folder");
         ImGui::EndTooltip();
     }
 

@@ -5,7 +5,7 @@
 #include <vector>
 
 // One file worth comparing. The walk fills in everything up to rootIndex; the
-// cascade stages fill in the hashes as the file survives each of them.
+// cascade rows fill in the hashes as the file survives each of them.
 struct FileEntry {
     std::string path;  // absolute, no trailing slash
     uint64_t size = 0;
@@ -54,30 +54,9 @@ enum class TieBreak {
 const char* tieBreakName(TieBreak t);
 extern const char* const kTieBreakNames[5];
 
-// Which comparison stages run. Size is always on: it is free, it comes out of
-// the walk, and it is what makes every later stage affordable.
-struct StageSettings {
-    bool sameName = false;   // basename must match too
-    bool sameMtime = false;  // mtime must match too
-    bool headBytes = true;
-    uint64_t headSize = 65536;
-    bool fullHash = true;
-    bool exactCompare = true;
-    int hashThreads = 4;
-};
-
-// Applied during the walk, so no later stage has to know about them.
+// The two walk-level choices that are not per-file predicates, so they are not
+// pipeline rows. Everything else that shapes a scan lives in the Pipeline.
 struct ScopeFilters {
-    uint64_t minSize = 1;  // 1 excludes zero-byte files, which are all identical
     bool includeHidden = false;
     bool collapseHardlinks = true;
-    std::string excludeGlobs;  // one glob per line
 };
-
-std::string formatSize(uint64_t bytes);
-std::string formatCount(uint64_t n);   // thousands separated
-std::string formatTime(int64_t unixTime);
-
-// Scans of a cached tree finish in milliseconds, so seconds alone would report
-// every one of them as "0.0s".
-std::string formatDuration(double seconds);

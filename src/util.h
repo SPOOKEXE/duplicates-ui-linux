@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 // XDG base directories, each with the documented fallback. The trailing
@@ -32,3 +33,19 @@ bool moveFile(const std::string& from, const std::string& to, std::string& err);
 
 std::string escapeField(const std::string& s);    // \\ \t \n for TSV records
 std::string unescapeField(const std::string& s);
+
+std::string formatSize(uint64_t bytes);
+std::string formatCount(uint64_t n);  // thousands separated
+std::string formatTime(int64_t unixTime);
+
+// Scans of a cached tree finish in milliseconds, so seconds alone would report
+// every one of them as "0.0s".
+std::string formatDuration(double seconds);
+
+// Hands a path to the desktop's own handler, so a folder opens in whatever file
+// manager the user actually uses. Detached: a missing or slow handler must not
+// block the frame loop or leave a zombie behind.
+bool openInFileManager(const std::string& path);
+
+// The same, for a file: opens the folder that contains it.
+bool openContainingFolder(const std::string& path);

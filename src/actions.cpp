@@ -7,6 +7,7 @@
 #include <cstring>
 #include <filesystem>
 
+#include "log.h"
 #include "util.h"
 
 namespace fs = std::filesystem;
@@ -72,7 +73,7 @@ ActionQueue::~ActionQueue() {
 }
 
 void ActionQueue::start(std::vector<ActionItem> items, ActionKind kind,
-                        std::string quarantineRoot) {
+                        std::string quarantineRoot, Log* log) {
     if (running_.load()) return;
     if (thread_.joinable()) thread_.join();
 
@@ -89,7 +90,7 @@ void ActionQueue::start(std::vector<ActionItem> items, ActionKind kind,
     cancel_.store(false);
     running_.store(true);
     thread_ = std::thread(&ActionQueue::run, this, std::move(items), kind,
-                          std::move(quarantineRoot));
+                          std::move(quarantineRoot), log);
 }
 
 void ActionQueue::cancel() { cancel_.store(true); }
@@ -111,9 +112,17 @@ bool ActionQueue::takeSummary(RunSummary& out) {
 }
 
 void ActionQueue::run(std::vector<ActionItem> items, ActionKind kind,
-                      std::string quarantineRoot) {
+                      std::string quarantineRoot, Log* log) {
     RunSummary summary;
     summary.kind = kind;
+
+    uint64_t plannedBytes = 0;
+    for (const auto& item : items) plannedBytes += item.size;
+    if (log) {
+        log->warn(std::string(actionKindName(kind)) + " run started: " +
+                  formatCount(items.size()) + " file(s), " + formatSize(plannedBytes) +
+                  (kind == ActionKind::Quarantine ? " -> " + quarantineRoot : ""));
+    }
 
     ManifestWriter manifest;
     const std::string manifestPath = newManifestPath(kind, quarantineRoot, timestampNow());
@@ -124,6 +133,7 @@ void ActionQueue::run(std::vector<ActionItem> items, ActionKind kind,
         ActionRow row;
         row.state = ActionState::Failed;
         row.error = "cannot write the run manifest at " + manifestPath;
+        if (log) log->error(row.error + ", so nothing was touched");
         progress_.failures.push_back(row);
         progress_.failed = 1;
         progress_.running = false;
@@ -138,6 +148,7 @@ void ActionQueue::run(std::vector<ActionItem> items, ActionKind kind,
     for (const auto& item : items) {
         if (cancel_.load()) {
             summary.cancelled = true;
+            if (log) log->warn("stopped by hand, the rest of the queue was left alone");
             break;
         }
 
@@ -185,6 +196,20 @@ void ActionQueue::run(std::vector<ActionItem> items, ActionKind kind,
             }
         }
 
+        // Written before the counters, so the log reads in the order the files
+        // were actually touched, and every path that went is named.
+        if (log) {
+            if (row.state != ActionState::Done) {
+                log->error("failed: " + item.path + "  (" + row.error + ")");
+            } else if (kind == ActionKind::Delete) {
+                log->info("deleted: " + item.path + "  (" + formatSize(item.size) +
+                          ", keeping " + item.keeper + ")");
+            } else {
+                log->info("moved: " + item.path + " -> " + row.dest + "  (" +
+                          formatSize(item.size) + ", keeping " + item.keeper + ")");
+            }
+        }
+
         std::lock_guard<std::mutex> lock(mutex_);
         ++progress_.done;
         if (row.state == ActionState::Done) {
@@ -200,6 +225,13 @@ void ActionQueue::run(std::vector<ActionItem> items, ActionKind kind,
     }
 
     manifest.close();
+
+    if (log) {
+        log->warn(std::string(actionKindName(kind)) + " run finished: " +
+                  formatCount(summary.done) + " done, " + formatCount(summary.failed) +
+                  " failed, " + formatSize(summary.bytes) + " reclaimed");
+        log->info("manifest: " + manifestPath);
+    }
 
     std::lock_guard<std::mutex> lock(mutex_);
     progress_.running = false;

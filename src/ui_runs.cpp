@@ -1,6 +1,8 @@
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
+#include "log.h"
 #include "ui.h"
 #include "util.h"
 
@@ -150,32 +152,75 @@ void drawRunsTab(AppState& s) {
 }
 
 void drawLogTab(AppState& s) {
-    if (ImGui::Button("Clear", ImVec2(90, 0))) s.engine.clearLog();
+    if (ImGui::Button("Clear", ImVec2(90, 0))) s.log.clear();
     ImGui::SameLine();
-    ImGui::TextColored(kDim,
-                       "unreadable files and directories, and anything that dropped out of the "
-                       "scan");
+    ImGui::Checkbox("info", &s.logShowInfo);
+    ImGui::SameLine();
+    ImGui::Checkbox("warn", &s.logShowWarn);
+    ImGui::SameLine();
+    ImGui::Checkbox("error", &s.logShowError);
+
+    ImGui::SameLine(0, 20);
+    ImGui::TextColored(kDim, "%zu info   %zu warn   %zu error",
+                       s.log.count(LogLevel::Info), s.log.count(LogLevel::Warn),
+                       s.log.count(LogLevel::Error));
+    const size_t dropped = s.log.dropped();
+    if (dropped > 0) {
+        ImGui::SameLine(0, 20);
+        // Said out loud rather than quietly implied: a truncated log that looks
+        // complete is worse than no log.
+        ImGui::TextColored(kWarn, "%s older line(s) scrolled off; the run manifest has them all",
+                           formatCount(dropped).c_str());
+    }
 
     if (s.haveResults) {
         const WalkStats& w = s.stats.walk;
         ImGui::TextColored(kDim,
-                           "skipped: %s hidden   %s below the size floor   %s symlinks   "
-                           "%s excluded   %s folded hardlinks   %s unreadable directories",
+                           "last walk skipped: %s hidden   %s below the floor   %s above the "
+                           "ceiling   %s symlinks   %s filtered   %s pruned folders   %s folded "
+                           "hardlinks   %s unreadable folders",
                            formatCount(w.skippedHidden).c_str(), formatCount(w.skippedSmall).c_str(),
+                           formatCount(w.skippedLarge).c_str(),
                            formatCount(w.skippedSymlink).c_str(),
-                           formatCount(w.skippedExcluded).c_str(),
-                           formatCount(w.collapsedLinks).c_str(),
-                           formatCount(w.dirErrors).c_str());
+                           formatCount(w.skippedFiltered).c_str(), formatCount(w.prunedDirs).c_str(),
+                           formatCount(w.collapsedLinks).c_str(), formatCount(w.dirErrors).c_str());
     }
 
-    ImGui::BeginChild("log", ImVec2(0, 0), true);
-    const std::vector<std::string> lines = s.engine.log();
+    // A "moved: <source> -> <destination>" line is two absolute paths long and
+    // must stay readable, so this pane scrolls sideways rather than clipping.
+    ImGui::BeginChild("log", ImVec2(0, 0), true, ImGuiWindowFlags_HorizontalScrollbar);
+    const std::vector<LogLine> all = s.log.lines();
+
+    // Filtered up front so the clipper's row count matches what is drawn.
+    std::vector<const LogLine*> shown;
+    shown.reserve(all.size());
+    for (const auto& line : all) {
+        const bool want = (line.level == LogLevel::Info && s.logShowInfo) ||
+                          (line.level == LogLevel::Warn && s.logShowWarn) ||
+                          (line.level == LogLevel::Error && s.logShowError);
+        if (want) shown.push_back(&line);
+    }
+
     ImGuiListClipper clipper;
-    clipper.Begin(static_cast<int>(lines.size()));
+    clipper.Begin(static_cast<int>(shown.size()));
     while (clipper.Step()) {
         for (int i = clipper.DisplayStart; i < clipper.DisplayEnd; ++i) {
-            ImGui::TextColored(kDim, "%s", lines[i].c_str());
+            const LogLine& line = *shown[i];
+            ImGui::TextColored(kDim, "%s", line.stamp.c_str());
+            ImGui::SameLine(70);
+            switch (line.level) {
+                case LogLevel::Error: ImGui::TextColored(kBad, "%s", line.text.c_str()); break;
+                case LogLevel::Warn: ImGui::TextColored(kWarn, "%s", line.text.c_str()); break;
+                case LogLevel::Info: ImGui::TextUnformatted(line.text.c_str()); break;
+            }
         }
+    }
+
+    // Only while something is running, so scrolling back through a finished run
+    // is not yanked to the bottom by a late line.
+    if ((s.engine.running() || s.actions.running()) &&
+        ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - ImGui::GetTextLineHeightWithSpacing()) {
+        ImGui::SetScrollHereY(1.0f);
     }
     ImGui::EndChild();
 }

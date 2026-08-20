@@ -136,7 +136,7 @@ void drawApplyConfirm(AppState& s) {
 
     ImGui::Separator();
     if (ImGui::Button("Apply", ImVec2(120, 0))) {
-        s.actions.start(collectSelected(s), s.action, s.quarantineRoot);
+        s.actions.start(collectSelected(s), s.action, s.quarantineRoot, &s.log);
         ImGui::CloseCurrentPopup();
     }
     ImGui::SameLine();
@@ -161,7 +161,7 @@ void drawRestoreConfirm(AppState& s) {
 
     ImGui::Separator();
     if (ImGui::Button("Restore", ImVec2(120, 0))) {
-        s.lastRestore = restoreRun(run);
+        s.lastRestore = restoreRun(run, &s.log);
         s.haveLastRestore = true;
         s.runsDirty = true;
         char msg[192];
@@ -200,8 +200,9 @@ void startScan(AppState& s) {
     s.rows.clear();
     s.expanded.clear();
     s.rowsDirty = true;
-    s.engine.clearLog();
-    s.engine.start(clean, s.scope, s.stages, s.tie, &s.cache);
+    // The log is deliberately not cleared: a scan, an apply and a restore are
+    // one session's story, and the timestamps keep them apart.
+    s.engine.start(clean, s.scope, s.pipeline, s.tie, &s.cache, &s.log);
 }
 
 std::vector<ActionItem> collectSelected(const AppState& s) {
@@ -241,7 +242,7 @@ SessionData sessionFromState(const AppState& s) {
     SessionData d;
     d.roots = s.roots;
     d.scope = s.scope;
-    d.stages = s.stages;
+    d.pipeline = s.pipeline;
     d.tie = s.tie;
     d.quarantineRoot = s.quarantineRoot;
     d.action = s.action;
@@ -254,7 +255,7 @@ SessionData sessionFromState(const AppState& s) {
 void applySession(AppState& s, const SessionData& d) {
     s.roots = d.roots;
     s.scope = d.scope;
-    s.stages = d.stages;
+    s.pipeline = d.pipeline;
     s.tie = d.tie;
     s.quarantineRoot = d.quarantineRoot;
     s.action = d.action;
@@ -262,7 +263,6 @@ void applySession(AppState& s, const SessionData& d) {
     s.filter = d.filter;
     s.showLog = d.showLog;
 
-    std::snprintf(s.globBuf, sizeof(s.globBuf), "%s", s.scope.excludeGlobs.c_str());
     std::snprintf(s.filterBuf, sizeof(s.filterBuf), "%s", s.filter.text.c_str());
     std::snprintf(s.quarBuf, sizeof(s.quarBuf), "%s", s.quarantineRoot.c_str());
 }
@@ -285,13 +285,13 @@ void drawUi(AppState& s) {
 
     // Inputs on the left, everything that shapes the scan on the right.
     const float half = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x) * 0.5f;
-    ImGui::BeginChild("inputs", ImVec2(half, 195));
+    ImGui::BeginChild("inputs", ImVec2(half, 265));
     drawInputs(s);
     ImGui::EndChild();
 
     ImGui::SameLine();
-    ImGui::BeginChild("stages", ImVec2(half, 195));
-    drawScopeAndStages(s);
+    ImGui::BeginChild("pipeline", ImVec2(half, 265));
+    drawPipeline(s);
     ImGui::EndChild();
 
     ImGui::Separator();
